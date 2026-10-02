@@ -1,0 +1,11 @@
+# build artifacts
+/hub
+/hub.exe
+/bin/
+/data/
+
+# logs
+*.log
+
+# env
+.env
