@@ -127,10 +127,23 @@ app/
 │   ├── login.vue            # 【阶段 4】登录
 │   ├── submit.vue           # 【阶段 4】提交镜像
 │   ├── dashboard.vue        # 【阶段 4】用户中心
+│   ├── docs/                # 【阶段 5】文档站（7 个页面）
+│   │   ├── index.vue        #   文档首页
+│   │   ├── quickstart.vue   #   快速开始
+│   │   ├── install.vue      #   安装与自检
+│   │   ├── pull-run.vue     #   拉取与运行
+│   │   ├── format.vue       #   镜像格式与下载源
+│   │   ├── submit.vue       #   提交镜像到 Hub
+│   │   └── faq.vue          #   常见问题
 │   └── about.vue            # 关于
 ├── types/api.ts             # 后端响应类型（含阶段 4 的 AuthUser/RepoInput 等）
-└── utils/format.ts          # 字节/数量/相对时间格式化 + 源类型元数据 + copyText
+└── utils/
+    ├── format.ts            # 字节/数量/相对时间格式化 + 源类型元数据 + copyText
+    └── docs.ts              # 【阶段 5】文档内容、导航与标题锚点渲染
 ```
+
+**阶段 5 新增组件**：`components/DocsLayout.vue`（文档布局：桌面 sticky 侧边导航 /
+手机折叠目录 / 本页小节锚点 / 上下页翻页）。
 
 ---
 
@@ -451,6 +464,47 @@ function commit(next: SourceRow[]) {
 - 页脚年份用 `useState` 固定
 - 登录态相关的 DOM 差异**一律在客户端渲染后出现**（SSR 阶段统一按未登录渲染）
 
+### 6.8 文档站（阶段 5）
+
+文档站不引入任何新依赖，复用既有渲染链路与组件风格：
+
+| 文件 | 职责 |
+|---|---|
+| `utils/docs.ts` | 文档内容（Markdown 常量）+ `DOC_PAGES` 结构 + `docNav` / `docNeighbors` / `renderDocMarkdown` |
+| `components/DocsLayout.vue` | 文档布局：侧边导航、手机折叠目录、本页锚点、上下页翻页、正文排版 |
+| `pages/docs/*.vue` | 7 个页面，每个仅一行 `<DocsLayout path="…" />`，标题与描述由数据驱动 |
+
+**内容与导航同源**：页面标题、`<title>`、描述、侧边导航标签、上下页全部从
+`DOC_PAGES` 派生，避免多处维护产生不一致。`pages/docs/*.vue` 因此只是薄壳，
+不重复声明 `useHead`。
+
+**标题锚点深链**：`useMarkdown.ts` 新增 `slugify` 与 `heading_open` 渲染规则，
+为 `##`/`###` 标题注入 `id`：
+
+- slug 规则：小写 → 去反引号与标点 → 空白转 `-`，**保留中日韩文字**
+  （如 `CLI 与 Hub 的对接现状` → `cli-与-hub-的对接现状`）
+- 同页重复标题自动加 `-1`、`-2` 后缀，避免 `id` 冲突
+- **通过 `anchors` 选项开关**：文档站开启，**镜像 README 保持关闭**（行为不变）
+- DOMPurify 的 `ADD_ATTR` 增加 `id`，否则清洗时会被剥掉导致锚点失效
+- 标题加 `scroll-margin-top: 5rem`，避免锚点跳转后被 sticky 头部遮挡
+
+> **⚠️ 踩坑记录**：首版未给标题注入 `id`，导致文档中手写的跨页深链
+> （如 `/docs/faq#cli-与-hub-的对接现状`）**全部是死链**。已用脚本逐条校验
+> 「目标页面存在 + 目标锚点存在」修复并回归。
+
+**手机端阅读体验**：
+
+- 侧边导航在 `lg` 以下收起为**点击展开**的折叠目录（不用 hover，规避坑 2）
+- 本页小节在手机端改为**横向滚动 chip 条**（`overflow-x-auto` + `w-max`）
+- 宽表格 `display: block` + `overflow-x-auto` 横向滚动；代码块 `pre` 同样可横向滚动，
+  避免撑破窄屏
+- 正文 `text-base`、行高 1.75；行内代码 15px 且 `word-break: break-all` 防长串溢出
+
+**内容准确性约束**：文档中的命令与 flag 照实抄录自真实 `boxli` 二进制
+（`boxli version 0.0.0-dev`），不臆造。实测发现 CLI 对接的是**另一套 Hub**
+（`boxli hub serve`），与本站 `/api/v1/*` 并非同一实现，已在 `/docs/faq` 首节
+如实标注可用范围，且**不提供**无法执行的示例。
+
 ---
 
 ## 七、API 参考
@@ -617,6 +671,23 @@ cd backend && go test ./... -count=1 -v
 
 前端：`eslint .` **0 error / 0 warning**；`nuxt build` 成功。
 
+### 9.1.1 文档站验证（阶段 5，2026-10-02）
+
+生产构建（`node .output/server/index.mjs`，:3077）下的脚本化校验：
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| 路由可用 | 逐个请求 7 个 `/docs*` 路径 | ✅ 全部 200 |
+| 标题正确 | 比对渲染出的 `<h1>` 与 `<title>` | ✅ 与 `DOC_PAGES` 一致 |
+| 内部链接 | 提取全部 `href="/docs…"` 并逐条解析 | ✅ **51 条全部可达** |
+| 跨页深链 | 校验「目标页面存在 **且** 目标锚点存在」 | ✅ `missing = none` |
+| 标题锚点 | 检查 `##` 是否带 `id`、重复标题是否去重 | ✅ 如 `cli-与-hub-的对接现状` |
+| README 回归 | 确认详情页 README 标题**不带** `id` | ✅ 行为未变 |
+| 既有页面回归 | `/`、`/explore`、`/search`、`/about`、`/login`、`/submit`、`/dashboard` | ✅ 全部 200 |
+| 手机端静态断言 | viewport / `100dvh` / 无 `100vh` / `overflow-x-hidden` / safe-area | ✅ 7 页全通过 |
+| 触控与字号 | 按钮 ≥44px、输入框 `text-base`、无 `group-hover` | ✅ 全通过 |
+| XSS 防护 | 构造 `<script>` / `<img onerror>` / `<iframe>` 载荷 | ✅ 无可执行节点 |
+
 ### 9.2 已实测的行为（curl，2026-10-02）
 
 | 类别 | 场景 | 结果 |
@@ -646,10 +717,11 @@ cd backend && go test ./... -count=1 -v
 | 项 | 状态 |
 |---|---|
 | **真实 GitHub 授权端到端** | ❌ **未完成** —— 被端口占用阻塞（见 [11.1](#111-当前阻塞真实授权联调)） |
-| 真实浏览器 / 真机测试 | ❌ 未做。阶段 3–4 全部为**静态断言** |
+| 真实浏览器 / 真机测试 | ❌ 未做。阶段 3–5 全部为**静态断言** |
 | `CopyButton` 宽度修复复测 | ❌ 未复测 |
 | Lighthouse Mobile ≥ 90 | ❌ 从未测量 |
 | 真实触摸延迟、iOS 滚动惯性、`100dvh` 动态表现、iOS 聚焦 | ❌ 未验证 |
+| 文档站 7 个页面的真实浏览器阅读体验 | ❌ 未做（阶段 5 同样只有静态断言） |
 
 以上需在**阶段 6** 用真实浏览器或真机补齐。
 
@@ -731,11 +803,27 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 > 该阻塞**不影响代码正确性**：Cookie 会话、302 回跳、CSRF、state 一次性消费、
 > 完整 CRUD 与权限校验均已 curl 逐项实测通过（见 [9.2](#92-已实测的行为curl2026-10-02)）。
 
-### 11.2 阶段 5：文档站 `/docs`
+### 11.2 阶段 5：文档站 `/docs` ✅ 已完成（2026-10-02）
 
-- 文档路由与侧边导航
-- 快速开始、安装、`pull`/`run` 命令、镜像格式说明、FAQ
-- 手机端阅读体验
+- [x] 文档路由与侧边导航（桌面 sticky + 手机折叠目录 + 本页小节锚点 + 上下页翻页）
+- [x] 快速开始、安装、`pull`/`run` 命令、镜像格式说明、FAQ（共 7 个页面）
+- [x] 手机端阅读体验（折叠目录、横向滚动 chip/表格/代码块、16px 正文）
+- [x] 标题锚点深链（`slugify` + `heading_open`，`anchors` 选项控制，README 行为不变）
+
+实现细节见 [6.8 文档站（阶段 5）](#68-文档站阶段-5)。
+
+**验证**：7 个路由全部 200；51 条内部链接与跨页深链逐条校验通过；
+`eslint` 0 error / 0 warning；`nuxt build` 成功。
+
+> **⚠️ 手机端仍为静态断言**（viewport、`100dvh`、`overflow-x-hidden`、44px 触控、
+> 16px 输入框、无 hover-only），**未做真实浏览器/真机测试**，
+> 与阶段 3/4 一致，真实验收属 [11.3](#113-阶段-6手机端全面验收)。
+
+> **⚠️ 内容准确性**：命令与 flag 抄录自真实 `boxli` 二进制（`0.0.0-dev`，实际 28 个子命令），
+> 镜像引用为 `NAME:VERSION`（无命名空间段），`pull` 为双语义。
+> 实测确认本机 `boxli` 对接的是**另一套 Hub**（`boxli hub serve`），
+> 与本站 `/api/v1/*` 并非同一实现 —— 已在 `/docs/faq` 首节如实标注，
+> 且不提供无法执行的示例。**CLI 与本站 Hub 的对接为后续工作项。**
 
 ### 11.3 阶段 6：手机端全面验收
 
@@ -766,6 +854,9 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 | 更新语义 | tags/sources **整体替换**：实现简单、语义明确；代价是前端必须全量回填 |
 | 优先级表达 | 由**数组顺序**决定：避免用户手填 `priority` 与顺序矛盾 |
 | 来源校验 | `url.Parse` 精确比较，而非前缀匹配（防前缀绕过） |
+| 文档内容载体 | **Markdown 常量 + 数据驱动导航**：复用 README 的安全渲染链路，页面仅为薄壳，标题/导航/翻页单点维护 |
+| 标题锚点开关 | `anchors` **选项控制**：文档站开启、README 关闭，避免改变既有渲染行为 |
+| 文档内容口径 | **以真实 CLI 为准**（抄录 `--help`），不按规格臆造；CLI 与本站 Hub 的差异**如实标注**而非掩盖 |
 
 ---
 

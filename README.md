@@ -53,10 +53,25 @@ frontend/app/
 │   ├── login.vue              # 登录（阶段 4）
 │   ├── submit.vue             # 提交镜像（阶段 4）
 │   ├── dashboard.vue          # 用户中心（阶段 4）
+│   ├── docs/                  # 文档站（阶段 5）
+│   │   ├── index.vue          #   文档首页
+│   │   ├── quickstart.vue     #   快速开始
+│   │   ├── install.vue        #   安装与自检
+│   │   ├── pull-run.vue       #   拉取与运行
+│   │   ├── format.vue         #   镜像格式与下载源
+│   │   ├── submit.vue         #   提交镜像到 Hub
+│   │   └── faq.vue            #   常见问题
 │   └── about.vue              # 关于
 ├── types/api.ts               # 后端响应类型定义
-└── utils/format.ts            # 格式化 + 源类型元数据
+└── utils/
+    ├── format.ts              # 格式化 + 源类型元数据
+    └── docs.ts                # 【阶段 5】文档内容与导航结构
 ```
+
+> **阶段 5 新增组件**：`components/DocsLayout.vue` —— 文档布局
+> （桌面 sticky 侧边导航 / 手机折叠目录 / 本页小节锚点 / 上下页翻页）。
+> `composables/useMarkdown.ts` 增加标题 `id` 锚点注入（由 `anchors` 选项控制，
+> **README 渲染保持原行为**）。
 
 > **⚠️ 为什么登录守卫只在客户端判定**：会话存在 httpOnly Cookie 中，**SSR 期间不会自动携带**
 > （服务端内部请求不带浏览器 Cookie）。若在 SSR 就判定，会把**已登录用户也误判为未登录**。
@@ -410,7 +425,7 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 
 > dev 模拟登录（未配 OAuth）见「本地开发 · 5. 登录联调」。
 
-## 前端页面（阶段 3）
+## 前端页面（阶段 3 + 阶段 5）
 
 | 路由 | 页面 | 数据来源 |
 |---|---|---|
@@ -422,6 +437,33 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 | `/login` | 登录：GitHub OAuth 入口、错误提示、已登录引导 | 静态 + `POST /auth/login` |
 | `/submit` | 提交镜像：动态标签与下载源 | `POST /repos`（需登录） |
 | `/dashboard` | 用户中心：我的镜像列表 / 编辑 / 删除 | `GET /repos?namespace=` + `PUT`/`DELETE` |
+
+### 文档站（阶段 5）
+
+| 路由 | 内容 |
+|---|---|
+| `/docs` | 文档首页：总览 + 阅读顺序 + 快速索引 |
+| `/docs/quickstart` | 快速开始：环境自检 → 导入镜像 → 运行容器 |
+| `/docs/install` | 安装与自检：源码构建、`doctor` 检查项、数据目录与环境变量 |
+| `/docs/pull-run` | 拉取与运行：`pull` / `run` 全部 flag 表、容器管理、停止语义 |
+| `/docs/format` | 镜像格式与下载源：`.boxli` 与 Docker 差异、10 种源类型、多架构、Boxfile |
+| `/docs/submit` | 提交镜像到 Hub：准备、表单字段、校验规则、整体替换语义 |
+| `/docs/faq` | 常见问题：**CLI 与 Hub 对接现状**、容器行为、登录与完整性校验 |
+
+文档内容为 `app/utils/docs.ts` 中的静态常量，经 `markdown-it(html:false)` + DOMPurify
+渲染（与镜像 README 同一条安全链路），标题自动注入 `id` 锚点以支持 `#小节` 深链。
+
+> **⚠️ 文档内容以真实 CLI 为准**：命令与 flag 抄录自本机 `boxli --help`
+> （`boxli version 0.0.0-dev`，实际 **28 个子命令**），未按规格臆造。
+> 其中**镜像引用为 `NAME:VERSION`**（无命名空间段），`pull` 为**双语义**
+> （传 `.boxli` 文件则导入，传 `NAME:VERSION` 才走 Hub）。
+>
+> **⚠️ CLI 与本站 Hub 尚未对接**：本机 `boxli` 对接的是另一套 Hub
+> （`boxli hub serve`：用户名/密码 + blob 存储），实测
+> `boxli search --hub http://127.0.0.1:3727` → `未登录`、
+> `boxli login --hub http://127.0.0.1:3727` → `hub 404 Not Found`。
+> 因此文档未提供 CLI 直连本站 Hub 的示例，现阶段请经网页端获取下载地址。
+> 详见 `/docs/faq` 首节。
 
 `/submit` 与 `/dashboard` 受 `auth` 中间件保护，未登录时跳转 `/login?redirect=<原路径>`，
 登录成功后原路返回。
@@ -443,6 +485,7 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 `CopyButton` 宽度缺陷（34px）并修复，但**该修复未复测**，且以下项**从未验证**：
 Lighthouse Mobile ≥ 90、真实触摸/滚动惯性、iOS 地址栏 `100dvh` 表现、iOS 聚焦实测。
 **阶段 4 新增的 `/login`、`/submit`、`/dashboard` 同样只有静态断言。**
+**阶段 5 新增的 7 个文档页（`/docs` 及子页面）亦为静态断言。**
 测试用浏览器与 `puppeteer-core` 已移除，需在**阶段 6** 补齐（详见 `plants.md`）。
 
 ## 进度
@@ -454,7 +497,7 @@ Lighthouse Mobile ≥ 90、真实触摸/滚动惯性、iOS 地址栏 `100dvh` �
 | 2 | 后端 API | ✅ 2026-10-02 |
 | 3 | 前端核心页面 | ✅ 2026-10-02（手机端验收部分待补，见下） |
 | 4 | 认证与提交 | 🔄 **代码已全部完成**；仅剩「人工点一次真实授权」被端口占用阻塞 |
-| 5 | 文档站 | 待做 |
+| 5 | 文档站 | ✅ 2026-10-02（7 个页面；手机端为静态断言，真实浏览器验收属阶段 6） |
 | 6 | 手机端全面验收 | 待做 |
 | 7 | 部署上线 | 待做 |
 

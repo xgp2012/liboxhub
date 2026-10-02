@@ -1258,15 +1258,83 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 
 ---
 
-### 阶段 5：文档站（1 天）
+### 阶段 5：文档站（1 天）✅ 已完成（2026-10-02）
+
+> **📌 标注**：本阶段延续第四节「手机优先」强约束，并为文档站补充**标题锚点深链**能力。
 
 **产出**：`/docs` 使用文档
 
-- [ ] 文档路由与布局（侧边 `Anchor` / `Menu` 导航）
-- [ ] 快速开始、安装、pull/run 命令、镜像格式说明、FAQ
-- [ ] 手机端文档阅读体验
+- [x] 文档路由与布局（桌面 sticky 侧边导航 + 手机折叠菜单 + 本页小节 `Anchor`）
+- [x] 快速开始、安装、pull/run 命令、镜像格式说明、FAQ
+- [x] 手机端文档阅读体验
 
 **验证**：`/docs` 全部页面手机模拟下可读、可跳转
+
+> **实际产出与验证记录：**
+>
+> **内容基准（重要）**：本阶段所有命令与 flag **照实抄录自本机真实 `boxli` 二进制**
+> （`boxli version 0.0.0-dev`）的 `--help` 输出，**未按规格臆造**。实测中发现规格与真实 CLI
+> 存在差异，已按实际实现为准并在文档中如实标注：
+>
+> | 项 | 规格描述 | 真实 CLI |
+> |---|---|---|
+> | 命令数量 | 仅提到 `pull` / `run` | 实际 **28 个**子命令（`build`/`commit`/`compose`/`volume`/`network`/`doctor` …） |
+> | 镜像引用 | `alice/myapp:v1`（含命名空间） | **`NAME:VERSION`**（无命名空间段） |
+> | `pull` 语义 | 仅从 Hub 拉取 | **双语义**：传 `.boxli` 文件则导入，传 `NAME:VERSION` 才走 Hub |
+>
+> **新增前端文件**：
+> - `app/utils/docs.ts`：文档内容与导航结构（7 个页面 + 导航 + 上下页 + `renderDocMarkdown`）
+> - `app/components/DocsLayout.vue`：文档布局（侧边导航 / 手机折叠目录 / 本页锚点 / 翻页）
+> - `app/pages/docs/`：`index.vue`、`quickstart.vue`、`install.vue`、`pull-run.vue`、
+>   `format.vue`、`submit.vue`、`faq.vue`
+> - 修改 `app/composables/useMarkdown.ts`：新增 `slugify` + `heading_open` 规则，
+>   为标题注入 `id` 锚点（**通过 `anchors` 选项开关，README 渲染保持原行为**）
+>
+> **内容覆盖**（对应验收项）：
+> - 快速开始（`/docs/quickstart`）、安装与自检（`/docs/install`）
+> - 拉取与运行（`/docs/pull-run`，含 `pull`/`run` 全部 flag 表）
+> - 镜像格式与下载源（`/docs/format`，含 `.boxli` 与 Docker 差异、10 种源类型、Boxfile 构建）
+> - 提交镜像到 Hub（`/docs/submit`）、常见问题（`/docs/faq`）
+>
+> **⚠️ 实测发现的规格外事实（已如实写入文档，未做掩盖）**：
+> 本机 `boxli` CLI 对接的是**另一套 Hub**（`boxli hub serve`：用户名/密码登录 + blob 存储），
+> 与本站后端（GitHub OAuth + 只存元数据）**并非同一实现**。实测证据：
+>
+> | 命令 | 结果 |
+> |---|---|
+> | `boxli search --hub http://127.0.0.1:3727` | `未登录 …请先 boxli login` |
+> | `boxli login --hub http://127.0.0.1:3727` | `hub 404 Not Found` |
+>
+> 因此文档中**未提供**「用 CLI 直连本站 Hub 拉取镜像」的可执行示例（避免给出无法工作的指令），
+> 改为引导用户经网页端获取下载地址后用 `boxli pull <file.boxli>` 导入；
+> 并在 `/docs/faq` 首节以「CLI 与 Hub 的对接现状」明确标注可用/不可用范围。
+> **CLI 与本站 Hub 的对接为后续工作项。**
+>
+> **验证结果**（生产构建 `node .output/server/index.mjs`，:3077）：
+> - **路由**：`/docs`、`/docs/quickstart`、`/docs/install`、`/docs/pull-run`、`/docs/format`、
+>   `/docs/submit`、`/docs/faq` 全部 **200**；标题与 `<title>` 均正确
+>   （如 `/docs/faq` → H1「常见问题」、title「常见问题 · Boxli 文档」）
+> - **导航与锚点**：7 项侧边导航齐全；**51 条文档站内部链接全部可达**；
+>   跨页深链（如 `/docs/faq#cli-与-hub-的对接现状`）经脚本逐条校验，
+>   **目标页面与目标锚点均存在**（`missing = none`）
+> - **标题锚点**：Markdown `##` 标题已注入 `id`（如 `cli-与-hub-的对接现状`），
+>   同页重复标题自动加 `-1` 后缀去重；并加 `scroll-margin-top: 5rem` 避免被 sticky 头部遮挡
+> - **回归**：镜像详情页 README 渲染**未受影响**（`anchors` 默认关闭，`<h1>` 仍无 `id`）；
+>   `/`、`/explore`、`/search?q=postgres`、`/about`、`/login`、`/submit`、`/dashboard` 全部 **200**
+> - **手机端清单（静态断言，对应第四节「无实机测试替代方案」）**：
+>   7 个文档页 viewport 正确注入；`100vh` 出现 **0** 次、`100dvh` 存在；
+>   `overflow-x-hidden` 均存在；页脚 safe-area 内边距保留；
+>   交互元素（按钮）**全部 ≥44px**（`min-h-11` / `h-11 w-11`）；
+>   输入框统一 `text-base`（16px，防 iOS 缩放）；无 `group-hover` 等 hover-only 显隐（坑 2 已规避）
+> - **窄屏排版**：宽表格与代码块用 `overflow-x-auto` 横向滚动，不撑破窄屏；
+>   本页小节锚点在手机端改为横向滚动 chip 条
+> - **XSS 防护实测**：文档正文统一走 `markdown-it(html:false)` + DOMPurify 同一条链路；
+>   构造 `<script>`、`<img onerror>`、`<iframe>` 载荷实测 —— `<script>`/`<iframe>` **被转义或过滤**，
+>   未产生可执行节点（该链路与阶段 3 README 渲染同源，已有验证基础）
+> - **工程质量**：`eslint .` **0 error / 0 warning**；`nuxt build` 成功
+>
+> **⚠️ 本阶段仍为静态断言**（与阶段 3/4 一致）：**未做真实浏览器/真机测试**。
+> Lighthouse Mobile、真实触摸与 iOS 行为等仍属**阶段 6**，不得视为已验收。
 
 ---
 
@@ -1319,18 +1387,25 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 | 2 ✅ | 后端 API | 2d | 1 |
 | 3 ✅ | 前端核心页面 | 3d | 2 |
 | 4 🔄 | 认证与提交（代码已完成，真实授权联调待补） | 2d | 2,3 |
-| 5 | 文档站 | 1d | 3 |
+| 5 ✅ | 文档站 | 1d | 3 |
 | 6 | 手机端全面验收 | 1d | 3,4,5 |
 | 7 | 部署上线 | 1d | 6 |
 
 **合计约 11.5 个工作日。** 关键路径：0 → 1 → 2 → 3 → 4 → 6 → 7。
 
 > 进度：阶段 0 已完成（2026-10-02）；阶段 1 已完成（2026-10-02）；阶段 2 已完成（2026-10-02）；
-> 阶段 3 已完成（2026-10-02）；
+> 阶段 3 已完成（2026-10-02）；**阶段 5 已完成（2026-10-02）**；
 > **阶段 4 代码已全部完成**：后端 OAuth + 302 回跳 + httpOnly Cookie 会话 + CSRF 来源校验 +
 > 开放重定向防护 + dev 登录开关；前端 `/login`、`/submit`、`/dashboard` + 鉴权状态管理全部落地。
 > **唯一未完成项是「人工点一次真实授权」**（被端口占用阻塞，见阶段 4 末尾），
 > 其余（Cookie 会话、302 链路、CSRF、state 一次性消费、完整 CRUD 与权限）均已 curl 实测通过。
+>
+> **阶段 5 已完成**：`/docs` 文档站 7 个页面（快速开始 / 安装自检 / 拉取运行 /
+> 镜像格式与下载源 / 提交镜像 / FAQ），桌面 sticky 侧边导航 + 手机折叠目录 + 本页锚点 +
+> 上下页翻页；Markdown 标题锚点深链可用（51 条内部链接全部可达）。
+> 内容照实抄录自真实 `boxli` 二进制（28 个子命令），并如实标注了
+> **CLI 与本站 Hub 尚未对接**这一规格外事实。
+> 与阶段 3/4 相同，手机端为**静态断言**，真实浏览器验收仍属阶段 6。
 >
 > **待处理遗留项**：见阶段 2 记录末尾的「遗留项 / 风险标注」表。
 > **开发环境已迁移到原生 Linux（Ubuntu 22.04）**，故 **L1 / L2 / L8 已随迁移消除**；
@@ -1350,6 +1425,8 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 > - 真实触摸延迟、iOS 滚动惯性、地址栏收缩下的 `100dvh` 动态表现
 > - iOS 输入框聚焦实测（当前仅静态确认字号 ≥16px）
 > - **阶段 4 新增页面同样只有静态断言**（`/login`、`/submit`、`/dashboard` 未做真实浏览器测试）
+> - **阶段 5 新增的 7 个文档页同样只有静态断言**（`/docs` 及其子页面未做真实浏览器测试，
+>   文档阅读体验的触摸滚动、代码块横向滚动手感未经真机确认）
 >
 > 测试用 `chrome-headless-shell` 与 `puppeteer-core` 依赖已按用户要求移除，
 > 阶段 6 需重新准备浏览器环境（或使用真机 / BrowserStack 等云真机）完成上述验收。
