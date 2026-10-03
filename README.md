@@ -1,9 +1,41 @@
 # boxli hub
 
+[![Build](https://github.com/xgp2012/liboxhub/actions/workflows/build.yml/badge.svg)](https://github.com/xgp2012/liboxhub/actions/workflows/build.yml)
+
 Boxli 官网 + Hub 镜像索引站的 monorepo。
 
 Hub **只收录社区镜像的元数据，不存储镜像本体** —— 镜像文件放在用户自己的地方
 （GitHub / Gitee / OSS / S3 / IPFS / BT 等），Hub 只记录「去哪下载」。
+
+> **部署形态（2026-10-03 起）**：前端产物（SSR bundle + 静态资源）已**内嵌进后端二进制**，
+> 生产部署只需「**一个 `boxli-hub` 二进制 + 一个 `hub.toml` + PostgreSQL**」，
+> 不再需要单独部署前端目录或第二个 systemd 服务。
+> 运行时依赖 **node**（用于服务端渲染，保证 SEO）。详见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。
+
+## 下载现成二进制
+
+CI（[`.github/workflows/build.yml`](./.github/workflows/build.yml)）会为 **linux/amd64**
+构建自包含二进制，两种获取方式：
+
+```bash
+# 方式一：从 Release 下载（打 v* tag 时自动创建）
+#   https://github.com/xgp2012/liboxhub/releases
+
+# 方式二：从 Actions 产物下载（每次 push 到 main 都会构建）
+#   https://github.com/xgp2012/liboxhub/actions/workflows/build.yml
+```
+
+校验与运行：
+
+```bash
+sha256sum -c boxli-hub.sha256
+./boxli-hub --version          # 查看版本与 commit
+./boxli-hub --config hub.toml  # 启动
+```
+
+> 二进制为**静态链接**（`CGO_ENABLED=0`），可在任意 Linux 发行版运行，
+> 且**体积约 27 MB** —— 其中包含内嵌的前端产物。
+> 服务器仍需安装 **Node.js**（SSR 依赖）与 PostgreSQL。
 
 ## 文档导航
 
@@ -11,7 +43,7 @@ Hub **只收录社区镜像的元数据，不存储镜像本体** —— 镜像�
 |---|---|
 | 本文档 | 项目概览、环境准备、启动步骤、配置字段、API 简表 |
 | [`DEVELOPMENT.md`](./DEVELOPMENT.md) | **开发者技术文档**：架构、模块职责、认证实现细节、调试与测试、安全设计 |
-| [`DEPLOYMENT.md`](./DEPLOYMENT.md) | **部署文档**：构建、systemd、Nginx、HTTPS、备份与排错 |
+| [`DEPLOYMENT.md`](./DEPLOYMENT.md) | **部署文档**：构建、单服务 systemd、首次引导、Nginx、HTTPS、备份与排错 |
 | [`plants.md`](./plants.md) | 立项时的分阶段计划 —— **历史存档**，含已被推翻的规格，不作为现行依据 |
 
 ---
@@ -34,6 +66,21 @@ Hub **只收录社区镜像的元数据，不存储镜像本体** —— 镜像�
 > 前提：PostgreSQL 已在 `127.0.0.1:5432` 运行、`backend/hub.toml` 已按需配置。
 > 完整的环境准备见[本地开发](#本地开发)。
 
+### 生产/单机部署（一个二进制）
+
+```bash
+make build                       # 先前端后后端，产出自包含的 backend/boxli-hub
+cd backend
+cp hub.toml.example hub.toml     # 首次，按需修改
+./boxli-hub                      # 前端由它托管，无需再起别的进程
+
+# 首次启动：日志会打印一次性引导令牌，浏览器打开
+#   http://127.0.0.1:3727/setup?token=<日志中的令牌>
+# 创建管理员账号后，引导接口永久关闭
+```
+
+### 本地开发（前后端分离热更新）
+
 ```bash
 # 后端（默认读当前目录 hub.toml）
 cd backend
@@ -49,10 +96,10 @@ curl http://localhost:3011/api/v1/health
 # {"code":0,"message":"ok","data":{"status":"healthy"}}
 ```
 
-> **⚠️ 本机前端不能用 3000 端口** —— `:3000` 属 **Forgejo**（系统服务，开机自启），
+> **⚠️ 开发模式下前端不能用 3000 端口** —— `:3000` 属 **Forgejo**（系统服务，开机自启），
 > 与 Boxli 无关。请改用 **3011** 或 **3077**，并确保 `hub.toml` 的
 > `[site] frontend_url` 指向同一端口，否则 OAuth 回跳会落错站点、写请求会被 403 拒绝。
-> 详见[配置文件](#配置文件)。
+> （单二进制部署模式下不存在此冲突，因为前端没有独立端口。）
 
 ## 技术栈
 
@@ -73,17 +120,22 @@ curl http://localhost:3011/api/v1/health
 ```
 hub/
 ├── frontend/          # Nuxt 4：官网 + Hub 前端 + 文档站
-├── backend/           # Go：Hub API（只存元数据）
-│   ├── cmd/hub/       #   服务入口
+│   └── scripts/       #   将 SSR 产物打包成单文件，供后端内嵌
+├── backend/           # Go：Hub API（只存元数据）+ 内嵌前端
+│   ├── cmd/hub/       #   服务入口（唯一进程）
 │   ├── cmd/seed/      #   种子数据入口（幂等）
 │   └── internal/
 │       ├── auth/      #   JWT + sessions、GitHub OAuth、state 一次性校验
 │       │              #    + cookie.go（httpOnly 会话 Cookie）
 │       │              #    + origin.go（CSRF 来源白名单校验）
+│       │              #    + setup_token.go（首次引导令牌）
 │       ├── config/    #   TOML 配置加载与校验（hub.toml）
 │       ├── db/        #   连接池 + 内嵌 SQL 迁移
-│       ├── hub/       #   HTTP 路由与处理器（读/写/认证）
-│       └── seed/      #   种子数据定义与写入
+│       ├── hub/       #   HTTP 路由与处理器（读/写/认证/引导）
+│       ├── localauth/ #   本地用户名+密码认证（bcrypt）
+│       ├── seed/      #   种子数据定义与写入
+│       └── web/       #   内嵌前端产物 + 托管 node SSR 子进程
+├── Makefile           # 一条命令完成「前端打包 + 后端内嵌」构建
 ├── README.md          # 本文档
 ├── DEVELOPMENT.md     # 开发者技术文档
 ├── DEPLOYMENT.md      # 部署文档
@@ -247,13 +299,15 @@ curl -s -X POST https://github.com/login/oauth/access_token \
 
 ## 配置文件
 
-后端**不使用任何环境变量**，全部配置来自 TOML 文件。默认读取当前目录的 `hub.toml`，
-可用 `--config` 指定其他路径 —— 这是二进制**唯一**解析的命令行参数。
+后端**不使用任何环境变量**，全部配置来自 TOML 文件。默认读取当前目录的 `hub.toml`。
 
 ```bash
 ./boxli-hub                                     # 读 ./hub.toml
 ./boxli-hub --config /etc/boxli-hub/hub.toml    # 读指定文件
+./boxli-hub --no-ssr                            # 不启动 SSR（仅静态资源，会损失 SEO）
 ```
+
+二进制只解析这两个参数：`--config` 与 `--no-ssr`。
 
 ### 字段一览
 
@@ -264,11 +318,13 @@ curl -s -X POST https://github.com/login/oauth/access_token \
 | `[session] jwt_secret` | 空 | JWT 签名密钥（**必填**才能登录，未设则认证接口返回 503；≥16 字符）|
 | `[session] ttl_hours` | `720` | 会话有效期（小时）|
 | `[session] cookie_secure` | `false` | 会话 Cookie 是否带 `Secure`。生产 HTTPS 必须 `true`；本地 `http://` 必须 `false` |
-| `[github] client_id` | 空 | GitHub OAuth Client ID |
+| `[github] client_id` | 空 | GitHub OAuth Client ID（**可整段留空**，改用本地密码登录）|
 | `[github] secret` | 空 | GitHub OAuth Client Secret（**禁止提交/外泄**）|
 | `[github] redirect` | 空 | GitHub OAuth 回调地址（须与 App 登记一致；配了凭据则必填）|
-| `[site] frontend_url` | `http://localhost:3011` | OAuth 回跳落点，**同时是写接口的 CSRF 来源白名单** |
+| `[site] frontend_url` | `http://127.0.0.1:3727` | 对外访问地址，**同时是写接口的 CSRF 来源白名单** |
 | `[site] extra_origins` | `[]` | 额外允许的跨站来源（数组），仅多域名/CI 场景 |
+| `[frontend] node_path` | 空 | node 可执行文件路径，留空则从 `PATH` 查找 |
+| `[frontend] allow_missing_node` | `false` | 找不到 node 时是否降级启动（不推荐，会损失 SEO）|
 | `[dev] enabled` | `false` | **⚠️ 模拟登录后门**，设为 `true` 时程序拒绝启动 |
 
 > 完整注释版见 [`backend/hub.toml.example`](./backend/hub.toml.example)。
@@ -324,6 +380,8 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 - `sources` — 每个标签的多个下载源（`type`/`url`/`priority`/`region`）
 - `oauth_states` — OAuth 的一次性 state（10 分钟 TTL）
 
+`users` 表在 `0003` 迁移后新增 `password_hash`（本地密码，可为 NULL）与 `is_admin`。
+
 完整 DDL 与索引见 [`DEVELOPMENT.md`](./DEVELOPMENT.md#三数据模型)。
 
 ## API 简表
@@ -335,7 +393,7 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 健康检查 |
+| GET | `/health` | 健康检查（⚠️ 恒返 healthy，不探数据库） |
 | GET | `/search?q=&limit=` | 搜索公开仓库 |
 | GET | `/repos?namespace=&limit=&offset=` | 仓库列表 |
 | GET | `/repos/{ns}/{repo}` | 仓库详情（含所有 tags 与 sources） |
@@ -347,9 +405,17 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/auth/login` | 已配 OAuth 返回 `authorize_url`；否则需 dev 登录开启才可模拟登录 |
+| POST | `/auth/password` | **本地用户名 + 密码登录**（与 OAuth 并存） |
 | GET | `/auth/callback?code=&state=` | 校验并消费 state → 换 token → **302 回前端**（会话经 Cookie 下发） |
 | GET | `/auth/me` | 当前用户（Cookie 或 Bearer） |
 | POST | `/auth/logout` | 登出，吊销 session 并清 Cookie |
+
+**首次部署引导**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/setup?token=` | 引导页面（自包含 HTML，不依赖前端产物） |
+| POST | `/setup` | 创建首个管理员。需携带启动日志中的一次性令牌；系统已有用户时永久关闭 |
 
 **写接口（需登录）**
 
@@ -398,15 +464,28 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 
 ## 当前状态
 
-功能已全部实现（官网、Hub 索引、认证与提交、文档站）。**尚缺整机验收与上线**：
+功能已全部实现（官网、Hub 索引、认证与提交、文档站、单二进制部署、首次引导）。
+**尚缺整机验收与上线**：
 
 | 项 | 状态 |
 |---|---|
 | 后端 API、数据库、认证、CSRF / 开放重定向 / state 防护 | ✅ 已实现，curl 逐项实测 + 单元测试通过 |
 | 前端页面、文档站（7 页） | ✅ 已实现，`eslint` 0 error、`nuxt build` 成功 |
+| **单二进制内嵌前端（含 SSR）** | ✅ 已实现并实测：空目录 + 单个二进制即可运行全部 10 个页面 |
+| **首次部署引导（建表 + 创建管理员）** | ✅ 已实现并实测：令牌校验、弱口令拒绝、初始化后永久关闭 |
+| **本地用户名/密码登录** | ✅ 已实现（bcrypt），与 GitHub OAuth 并存 |
 | **真实 GitHub 授权端到端** | 🔄 代码就绪，**尚缺人工点一次授权** |
 | **手机端真机 / 浏览器验收** | ⬜ 待做（现有仅为静态断言） |
 | **部署上线** | ⬜ 待做，见 [`DEPLOYMENT.md`](./DEPLOYMENT.md) |
+
+**单二进制实测结论（2026-10-03）**：
+
+- 产物 **33 MB**，部署目录只需 `boxli-hub` + `hub.toml` 两个文件
+- 全部 10 个页面 SSR 正常（`/` 12637 字节、`/docs` 16117 字节，`<title>` 与
+  `<meta name="description">` 均在服务端 HTML 中 → **SEO 保留**）
+- 静态资源由 Go 直接伺服（`/_nuxt/*.css` → 200 / 124958 字节）
+- 首次启动打印引导令牌；无令牌/错令牌 403；创建后重放 403；重启不再开启引导
+- `SIGKILL` 主进程后 node 子进程**不残留**（`Pdeathsig` 生效），临时目录自动清理
 
 **⚠️ 手机端尚未真实验收**：目前仅完成**静态断言**（viewport、`100dvh`、无固定宽度、
 输入框 16px、44px 触控类名、`overflow-x-hidden`）。以下**从未验证**，不得视为已验收：
@@ -420,21 +499,24 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 
 **上线前必办**：
 
-1. ⚠️ **Regenerate `[github] secret`** —— 当前值曾明文外泄
+1. ⚠️ **Regenerate `[github] secret`** —— 当前值曾明文外泄（若启用 OAuth）
 2. ⚠️ 更新 GitHub App 的 **Authorization callback URL** 为生产地址
 3. ⚠️ `[session] cookie_secure = true`、`[site] frontend_url` 改为生产域名、
    重新生成 `[session] jwt_secret`
+4. ⚠️ 确认服务器**已安装 node**（SSR 必需，缺失会导致启动失败）
 
 完整清单见 [`DEPLOYMENT.md`](./DEPLOYMENT.md#七上线前安全清单)。
 
-### 后端测试
+### 构建与测试
 
 ```bash
-cd backend && go test ./...
+make build     # 前端打包 + 后端内嵌（必须按此顺序）
+make test      # go test ./...
 ```
 
 覆盖：来源白名单校验、OriginGuard、会话 Cookie 属性、state 单次消费/伪造/过期、
-开放重定向防护、**TOML 配置加载与校验**（21 个用例，含日志脱敏断言）。
+开放重定向防护、**TOML 配置加载与校验**（21 个用例，含日志脱敏断言）、
+**密码与用户名强度校验**、**安装令牌随机性与恒定时间比较**、**go:embed 资源完整性**。
 
 > `internal/auth` 的 state 测试需连接数据库（读 `hub.toml` 的 `[db] url`），
 > 连不上会自动 skip，不影响无库环境。

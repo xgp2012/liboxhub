@@ -4,6 +4,10 @@
 > 凡与 `plants.md` 第九章至第十一章冲突之处，**以本文档为准**（差异原因逐条标注）。
 >
 > 核查日期：2026-10-03 · 核查方式：构建实测 + 全栈运行实测 + 源码通读
+>
+> **2026-10-03 重大变更**：前端产物已内嵌进后端二进制（`go:embed`），
+> 部署形态从「两进程 + 两 systemd unit」简化为**一个二进制 + 一个配置文件**。
+> 前端 systemd unit 已**不再需要**。详见第一节与第四节。
 
 ---
 
@@ -13,8 +17,8 @@
 - [一、架构与端口](#一架构与端口)
 - [二、构建（实测通过）](#二构建实测通过)
 - [三、数据库准备](#三数据库准备)
-- [四、后端 systemd](#四后端-systemd)
-- [五、前端 systemd](#五前端-systemd)
+- [四、systemd（单服务）](#四systemd单服务)
+- [五、首次部署引导](#五首次部署引导)
 - [六、Nginx 与 HTTPS](#六nginx-与-https)
 - [七、上线前安全清单](#七上线前安全清单)
 - [八、验收步骤](#八验收步骤)
@@ -61,94 +65,153 @@ ExecStart=/usr/local/bin/boxli hub serve \
 - `frontend/nuxt.config.ts:16` 有 `routeRules: { '/api/**': { proxy: 'http://127.0.0.1:3727/api/**' } }` —— 这是 **Nitro 运行时**代理。SSG 只产出静态文件，没有 Node 服务，这个代理**根本不存在**，所有 API 请求会 404。
 - 首页与详情页用了 `await useRepoList()` / `await useRepoDetail()`（`index.vue:105`、`explore/[ns]/[repo].vue:100`），是**服务端取数**。静态生成时若后端不在线，会把错误状态**烙进 HTML**。
 
-**✅ 正确做法**：用 `npm run build`（preset = `node-server`），跑 `node .output/server/index.mjs`。
+**✅ 正确做法**：用 `npm run build`（preset = `node-server`），保留 SSR。
+
+> **2026-10-03 补充**：SSR 现在是**内嵌**在 Go 二进制里执行的（见第一节），
+> 但对「必须保留 SSR」这一结论没有影响 —— SEO 依赖服务端渲染的 HTML。
+> 曾评估过 `ssr: false`（纯 SPA），**因会丢失 SEO 而否决**。
 
 ### 坑 3：`[site] frontend_url` 身兼两职，设错会同时坏两件事
 
 它**既是** OAuth 成功后的 302 回跳落点，**又是**写接口的 CSRF 来源白名单
 （`config.go` 的 `AllowedOrigins()`）。生产环境必须是 `https://boxli.dev`。
 
-实测验证该机制确实生效（本地 3011 端口场景）：
+实测验证该机制确实生效：
 
 ```
-POST 带 Origin: http://127.0.0.1:3011  -> 401（通过 CSRF，仅缺登录）   ✅
-POST 带 Origin: http://evil.com        -> 403（CSRF 拦截）             ✅
+POST 带 Origin: 白名单内  -> 401（通过 CSRF，仅缺登录）   ✅
+POST 带 Origin: evil.com  -> 403（CSRF 拦截）             ✅
 ```
+
+> **单二进制下要注意**：前后端由**同一个端口**提供，因此 `frontend_url`
+> 应填**对外访问地址**（如 `https://boxli.dev`），而不是 `127.0.0.1:3727`。
+> 只有在本地直连调试时才填回环地址。
 
 ---
 
 ## 一、架构与端口
 
-**两进程 + 一数据库**，后端与数据库**只绑回环**，外部不可直达：
+**一个进程 + 一个数据库**，后端与数据库**只绑回环**，外部不可直达：
 
 | 组件 | 形态 | 监听 | 代码位置 |
 |---|---|---|---|
-| 后端 | 单个 Go 静态二进制 | `127.0.0.1:3727` | `backend/cmd/hub/main.go` |
-| 前端 | Nuxt 4 Node SSR 服务 | `127.0.0.1:3000` | `frontend/.output/server/index.mjs` |
+| 后端 + 前端 | **单个 Go 二进制**（内嵌前端产物） | `127.0.0.1:3727` | `backend/cmd/hub/main.go` |
+| ├─ 静态资源 | `go:embed`，Go 直接伺服 | 同上 | `backend/internal/web/web.go` |
+| ├─ API | Go 原生处理 | 同上 | `backend/internal/hub/server.go` |
+| └─ SSR 渲染 | node 子进程（内嵌 bundle 释放后执行） | `127.0.0.1:<随机端口>` | `backend/internal/web/web.go` |
 | 数据库 | PostgreSQL | `127.0.0.1:5432` | `backend/internal/db/db.go` |
 
 请求链路：
 
 ```
-浏览器 ──HTTPS──> Nginx :443
-                    ├── /api/  ──proxy──> 127.0.0.1:3727  (Go 后端)
-                    └── /*     ──proxy──> 127.0.0.1:3000  (Nuxt SSR)
-                                              │
-                                              └── Nuxt routeRules 再代理 /api/** ──> 3727
+浏览器 ──HTTPS──> Nginx :443 ──proxy──> 127.0.0.1:3727  (唯一的 boxli-hub 进程)
+                                            ├── /_nuxt/*  静态资源，Go 直接返回
+                                            ├── /api/*    Go 原生处理
+                                            └── 其他      → 内部反代到 node 子进程（SSR）
 ```
 
-> **关于两层 `/api` 代理**：生产环境下 Nginx 已经把 `/api/` 直接转给 3727，
-> 请求不会进入 Nuxt；Nuxt 内的 `routeRules` 代理在**本地开发**时才是主路径。
-> 两者并存不冲突，无需删除。
+**与旧架构的差异**：
+
+| | 旧（两进程） | 新（单二进制） |
+|---|---|---|
+| 进程数 | 2（Go + Node） | 1（Go 托管 Node 子进程） |
+| systemd unit | 2 个 | **1 个** |
+| 部署文件 | 二进制 + `.output/` 目录（1427 个文件） | **二进制 + hub.toml** |
+| Nginx location | 2 条（`/api/` 与 `/`） | **1 条**（全部转 3727） |
+| Node 依赖 | 需要（跑前端） | **仍需要**（SSR 必须由 Node 执行） |
+| 端口 | 3727 + 3000 | 仅 3727（SSR 用随机内部端口） |
+
+> **为什么仍需要 Node**：Go 无法执行 JavaScript。实测纯 Go 引擎 `goja`
+> 会在打包产物的**第一个正则字面量**上 panic（不支持 ES2020+ 正则 `u` 标志），
+> 而 Nitro/Vue 产物必然包含这类语法。Node SEA（`--experimental-sea-config`）
+> 也不可行——实测其 blob 仅 429 字节，`main` 只是路径引用，不内联依赖。
+> 因此 Node 是**运行时依赖**，但前端**产物**完全内嵌，无需任何外部文件。
 
 **端口分配（生产机）**：
 
 | 端口 | 用途 | 对外暴露 |
 |---|---|---|
 | 80 / 443 | Nginx | ✅ 公开 |
-| 3000 | Nuxt SSR | ❌ 仅回环 |
-| 3727 | Go 后端 | ❌ 仅回环 |
+| 3727 | boxli-hub（API + 静态资源 + SSR 入口） | ❌ 仅回环 |
+| 随机高位端口 | boxli-hub 内部的 node SSR 子进程 | ❌ 仅回环（程序自动分配） |
 | 5432 | PostgreSQL | ❌ 仅回环 |
 
 > **⚠️ 本开发机特例**：本机 `:3000` 已被 **Forgejo**（`forgejo.service`，uid 115）长期占用。
-> 因此在**本机**做部署演练时，前端端口必须换成 **3011** 或 **3077**，并同步改 `hub.toml` 的 `[site] frontend_url`。
-> 生产服务器若无此冲突，用 3000 即可。
+> 单二进制架构下**不再需要给前端单独分配端口**，因此这个冲突自然消失。
+> 但**本地开发模式**（`make dev-frontend`，即 `nuxt dev`）仍需要端口，
+> 请使用 **3011**，并把 `hub.toml` 的 `[site] frontend_url` 同步改成 `http://localhost:3011`。
 
 ---
 
 ## 二、构建（实测通过）
 
-### 2.1 后端
+### 2.1 一条命令（推荐）
+
+仓库根目录提供了 `Makefile`，**必须按「先前端、后后端」的顺序构建**：
+
+```bash
+make build        # = make frontend + make backend
+```
+
+**实测结果**：产物 `backend/boxli-hub`，**33 MB** 单二进制（含内嵌前端）。
+
+> ⚠️ **不要跳过前端直接 `go build`**。
+> `go:embed` 在**编译期**读取 `backend/internal/web/dist`：
+> 该目录缺失时编译会**直接报错**（`pattern all:dist: no matching files found`），
+> 这是有意设计 —— 宁可明确失败，也不要产出一个前端全 404 的二进制。
+
+### 2.2 前端（`make frontend` 做的事）
+
+```bash
+cd frontend
+npm ci
+npm run build              # Nuxt 构建 → .output/
+npm run build:ssr-bundle   # esbuild 打包 → backend/internal/web/dist/
+```
+
+构建分两步，原因：
+
+1. `npm run build` 产出 Nuxt 的 `.output/`，其中 `server/` 依赖同目录
+   `node_modules/`（**约 19 MB，含 8.6 MB jsdom**），共 1427 个文件。
+2. `build:ssr-bundle` 用 esbuild 把 SSR 服务端**内联成单个 `ssr.mjs`**
+   （实测 **15.2 MB / gzip 2.0 MB**），并把客户端静态资源拷到 `dist/public/`。
+   打包后不再需要 `node_modules`，可整体 `go:embed`。
+
+**实测（2026-10-03）**：打包产物在**空目录**下可直接 `node ssr.mjs` 运行，
+且 SSR 渲染结果与未打包时**完全一致**（首页 12637 字节、`/docs` 16117 字节）。
+
+> **打包脚本处理的两个 jsdom 兼容问题**（见 `frontend/scripts/`）：
+> 1. jsdom 是 CommonJS，用动态 `require('node:fs')` 与 `__dirname`。
+>    esbuild 打成 ESM 后这些无法解析 → 注入 `createRequire` 兼容层。
+> 2. jsdom 在加载时用 `__dirname` 相对路径读 `default-stylesheet.css`，
+>    并用 `require.resolve` 定位 `xhr-sync-worker.js`。
+>    单文件后这两个路径失效 → 前者**内联为字符串常量**，后者替换为占位
+>    （该 worker 仅用于同步 XHR，DOMPurify 不使用 XHR）。
+
+### 2.3 后端（`make backend` 做的事）
 
 ```bash
 cd backend
 go build -o boxli-hub ./cmd/hub
 ```
 
-**实测结果**：产物 **17 MB** 静态二进制，`go build` 与 `go vet ./...` 均**通过**。
-
 - 模块名：`github.com/LiStudioorg/boxli`
 - Go 版本要求：`go 1.27`
-- 依赖：`pgx/v5 v5.11.0`、`golang-jwt/jwt/v5 v5.3.1`
+- 依赖：`pgx/v5 v5.11.0`、`golang-jwt/jwt/v5 v5.3.1`、`golang.org/x/crypto`（bcrypt）
 
-> 二进制**无外部运行时依赖**（纯 Go + pgx），可直接拷到服务器，无需装 Go。
+> **服务器需要两个运行时**：拷过去的二进制**不需要 Go**，
+> 但**需要 Node.js**（用于 SSR）。实测环境 node v24.21.0。
+> 若未安装 node，程序启动即报错并给出提示（不会静默降级）。
 
-### 2.2 前端
+### 2.4 其他 make 目标
 
 ```bash
-cd frontend
-npm ci
-npm run build
+make test         # go test ./...
+make vet          # go vet ./...
+make clean        # 清理二进制与前端产物
+make dev-backend  # 本地起后端（读取 backend/hub.toml）
+make dev-frontend # 本地起前端（端口 3011，勿用 3000）
 ```
-
-**实测结果**：`✨ Build complete!`，产物 `.output/` 共 **15.9 MB（gzip 3.1 MB）**，
-preset = `node-server`，Nitro 2.13.4 / Nuxt 4.5.2。
-
-**服务器需装 Node.js**（实测环境 v24.21.0）。只需拷贝 `.output/` 目录即可部署，
-**不需要**把 `node_modules/` 或源码带上服务器。
-
-> `fuxsto-design` 是运行时依赖（`1.0.4`），其 CSS 走 `nuxt.config.ts` 的 `css: [...]` 注入，
-> 已在构建时打包进 `.output/`，无需额外处理。
 
 ---
 
@@ -172,8 +235,16 @@ openssl rand -base64 24
 **不需要单独执行迁移命令。** `backend/cmd/hub/main.go` 启动时会调用 `db.Migrate()`，
 按文件名顺序执行内嵌的 `migrations/*.sql`，并记录在 `schema_migrations` 表（幂等，可重复启动）。
 
-已有迁移：`0001_init.sql`（users/repositories/tags/sources/sessions）、
-`0002_oauth_states.sql`（OAuth state）。
+已有迁移：
+
+| 文件 | 内容 |
+|---|---|
+| `0001_init.sql` | users / repositories / tags / sources / sessions |
+| `0002_oauth_states.sql` | OAuth state（一次性凭证） |
+| `0003_local_auth.sql` | `users.password_hash`、`users.is_admin`、用户名大小写不敏感唯一索引 |
+
+> **`0003` 说明**：新增 `password_hash`（可为 NULL）与 `is_admin`（默认 false），
+> 对既有数据完全兼容 —— 老的纯 OAuth 用户 `password_hash` 为 NULL，仍只能走 GitHub 登录。
 
 ### 3.3 种子数据（可选）
 
@@ -189,7 +260,7 @@ go run ./cmd/seed --config /etc/boxli-hub/hub.toml
 
 ---
 
-## 四、后端 systemd
+## 四、systemd（单服务）
 
 ### 4.1 安装二进制
 
@@ -201,6 +272,9 @@ sudo chown boxli:boxli /var/lib/boxli
 ```
 
 > 命名用 **`boxli-hub`** 而非 `boxli`，避免与既有 boxli CLI 冲突（见[坑 1](#坑-1plantsmd-里的-systemd-execstart-是错的)）。
+
+**只需要这一个文件**。前端产物已经内嵌在里面（33 MB），
+**不需要**再拷贝 `frontend/.output/` 或 `node_modules/`。
 
 ### 4.2 配置文件
 
@@ -222,15 +296,20 @@ ttl_hours = 720
 # ---- 生产 HTTPS 必须为 true ----
 cookie_secure = true
 
-# ---- GitHub OAuth（上线前必须重新生成 Secret！见第七节）----
+# ---- GitHub OAuth（可选；不用 OAuth 可整段留空）----
 [github]
-client_id = "<新的 Client ID>"
-secret = "<新的 40 位十六进制 Secret>"
+client_id = "<Client ID>"
+secret = "<Secret>"
 redirect = "https://boxli.dev/api/v1/auth/callback"
 
-# ---- 回跳落点 + CSRF 白名单（两者共用，必须是生产域名）----
+# ---- 回跳落点 + CSRF 白名单（两者共用，必须是**对外**访问地址）----
 [site]
 frontend_url = "https://boxli.dev"
+
+# ---- 内嵌前端（SSR）运行参数 ----
+[frontend]
+# node_path = "/usr/bin/node"     # 留空则从 PATH 查找
+# allow_missing_node = false      # 默认 false：找不到 node 就拒绝启动
 
 # ---- 生产必须保持关闭（设为 true 时程序直接拒绝启动）----
 [dev]
@@ -252,13 +331,17 @@ sudo chmod 600 /etc/boxli-hub/hub.toml
 > 浏览器会**直接丢弃** Cookie，症状是「登录看似成功但始终显示未登录」。
 > 两者不匹配时**程序会在启动阶段直接报错退出**，不会带病运行。
 
+> **`[site] frontend_url` 在单二进制下怎么填**：前后端同端口，
+> 填**对外访问地址**（`https://boxli.dev`）。它同时是 CSRF 白名单，
+> 填错会导致写接口 403。
+
 ### 4.3 unit 文件
 
 `/etc/systemd/system/boxli-hub.service`：
 
 ```ini
 [Unit]
-Description=Boxli Hub (Go backend)
+Description=Boxli Hub (single binary: API + SSR frontend)
 Documentation=https://boxli.dev/docs
 After=network.target postgresql.service
 Wants=postgresql.service
@@ -268,7 +351,7 @@ Type=simple
 User=boxli
 Group=boxli
 # ⚠️ 不要在这里加 --addr/--db/--data-dir，二进制不解析这些参数（见坑 1）
-# 唯一支持的是 --config，用于指定 TOML 配置文件路径
+# 支持的参数只有：--config、--no-ssr
 ExecStart=/usr/local/bin/boxli-hub --config /etc/boxli-hub/hub.toml
 Restart=always
 RestartSec=5
@@ -293,87 +376,132 @@ sudo systemctl status boxli-hub
 sudo journalctl -u boxli-hub -n 50 --no-pager
 ```
 
-**成功日志应包含三行**：
+**成功日志应包含**（首次部署还会多出引导提示，见第五节）：
 
 ```
-loaded config{path=/etc/boxli-hub/hub.toml addr=127.0.0.1:3727 db=postgres://boxli:***@127.0.0.1:5432/boxli_hub?sslmode=disable frontend=https://boxli.dev cookie_secure=true ttl=720h oauth=true dev_login=false}
+loaded config{path=/etc/boxli-hub/hub.toml addr=127.0.0.1:3727 db=postgres://boxli:***@... frontend=https://boxli.dev cookie_secure=true ttl=720h oauth=true dev_login=false}
 database migrated
+已有 N 个用户，跳过首次部署引导
+SSR 子进程已启动 (pid=12345, port=45678)
+Listening on http://127.0.0.1:45678
+SSR 已就绪 (port=45678)
 boxli hub listening on 127.0.0.1:3727
 ```
 
+> **SSR 端口是随机的**：每次启动由内核分配一个空闲回环端口（日志中的 `port=`），
+> 仅监听 `127.0.0.1`，外部不可达。无需在配置或防火墙中固定它。
+
+> **不需要单独的前端 unit**。旧版本要求 `boxli-frontend.service` 跑
+> `node .output/server/index.mjs`；现在由主进程托管，前端 unit 已废弃。
+> 若你从旧版本升级，记得 `sudo systemctl disable --now boxli-frontend` 并删除其 unit 文件。
+
+> **`HOST` 暴露问题已消除**：旧架构中 Nitro 默认监听 `[::]`（所有接口），
+> 漏设 `HOST=127.0.0.1` 会让前端**直接暴露在公网**并绕过 Nginx。
+> 现在端口由程序内部固定绑 `127.0.0.1`，不存在这个配置失误的可能。
+
+### 4.4 进程管理与清理
+
+程序退出时会：
+
+1. 向 node 子进程所在**进程组**发 SIGTERM（覆盖 node 可能派生的子进程）
+2. 若 5 秒内未退出，改发 SIGKILL
+3. 删除释放 SSR bundle 的临时目录（`/tmp/boxli-ssr-*`）
+
+此外设置了 `Pdeathsig`：即使主进程被 `SIGKILL` 强杀（来不及执行清理逻辑），
+内核也会自动终止 node 子进程，**不会留下孤儿进程占着端口和内存**。
+
 ---
 
-## 五、前端 systemd
+## 五、首次部署引导
 
-### 5.1 部署产物
+首次启动时，若数据库中**还没有任何用户**，程序会生成一次性安装令牌并打印到日志：
 
-```bash
-sudo mkdir -p /srv/boxli/frontend
-sudo cp -a frontend/.output /srv/boxli/frontend/
-sudo chown -R boxli:boxli /srv/boxli
+```
+────────────────────────────────────────────────────────────
+ 首次部署引导已启用：系统中还没有任何用户
+ 请在浏览器打开： http://<你的域名>/setup?token=3e942af8d100ef...（64 位十六进制）
+ 该令牌仅在本次启动且系统无用户时有效，初始化后立即作废。
+────────────────────────────────────────────────────────────
 ```
 
-只需 `.output/`，**不需要** `node_modules/` 与源码。
+打开该地址即可在网页上完成初始化：
 
-### 5.2 unit 文件
+1. **建表** —— 启动时已自动完成（`db.Migrate()`，幂等）
+2. **创建管理员** —— 填写用户名与密码，提交即可
 
-`/etc/systemd/system/boxli-frontend.service`：
+### 5.1 为什么需要令牌（安全设计）
 
-```ini
-[Unit]
-Description=Boxli Hub (Nuxt SSR frontend)
-After=network.target boxli-hub.service
-Wants=boxli-hub.service
+引导页若对公网开放，**任何人都能在你之前抢注管理员账号**。因此设置了三重防护：
 
-[Service]
-Type=simple
-User=boxli
-Group=boxli
-WorkingDirectory=/srv/boxli/frontend
-Environment=NODE_ENV=production
-Environment=PORT=3000
-Environment=HOST=127.0.0.1
-ExecStart=/usr/bin/node /srv/boxli/frontend/.output/server/index.mjs
-Restart=always
-RestartSec=5
+| 防护 | 说明 |
+|---|---|
+| 一次性安装令牌 | 32 字节随机（64 位十六进制），**只出现在服务端日志**。公网访问者看不到日志，无法抢先注册 |
+| 仅当无用户时可用 | 计数与插入在同一事务内完成，并发请求也无法创建出两个管理员 |
+| 恒定时间比较 | 令牌比较用 `subtle.ConstantTimeCompare`，避免时序侧信道推断 |
 
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/srv/boxli
+实测验证（本地全栈）：
 
-[Install]
-WantedBy=multi-user.target
+```
+GET  /setup                     -> 200（页面可取）
+POST /api/v1/setup 无令牌        -> 403
+POST /api/v1/setup 错误令牌      -> 403
+POST /api/v1/setup 弱口令        -> 400（"不能包含常见弱口令"）
+POST /api/v1/setup 正确令牌      -> 200（创建成功）
+POST 再次使用同一令牌            -> 403（已作废）
+重启后                          -> 日志显示"已有 1 个用户，跳过首次部署引导"
 ```
 
-启用：
+### 5.2 密码与用户名规则
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now boxli-frontend
-```
+| 项 | 规则 |
+|---|---|
+| 用户名 | 3–32 字符，仅限**英文字母、数字、下划线、连字符** |
+| 密码 | 至少 8 字符，不超过 72 字节，且不能包含常见弱口令 |
 
-> **`HOST=127.0.0.1` 很重要**：Nuxt/Nitro 默认监听 `[::]`（所有接口，实测日志为
-> `Listening on http://[::]:3011`）。不设 `HOST` 会让前端服务**直接暴露在公网**，
-> 绕过 Nginx。必须显式绑回环。
+用户名限制字符集是为了避免在 URL 路径（`/repos/{ns}/...`）与日志中引入歧义。
+密码上限 72 字节是因为 **bcrypt 只使用前 72 字节**，超出部分会被静默截断 ——
+限制它可避免用户误以为超长密码更安全。
 
-### 5.3 SSR 取数依赖后端
+密码用 **bcrypt 加盐哈希**存储，不可逆。登录失败时，「用户不存在」与「密码错误」
+返回**完全相同**的错误信息，且都会执行一次 bcrypt 比较以拉平耗时，
+防止通过错误信息或响应时间**枚举系统内已存在的用户名**。
 
-前端在服务端渲染时**会主动请求后端 `127.0.0.1:3727`**。
-因此 `boxli-frontend.service` 用 `Wants=boxli-hub.service` 表达依赖顺序，
-但**不保证后端就绪** —— 后端若挂了，前端页面会渲染成错误态而非 500。
-监控时两者都要看。
+### 5.3 管理员权限范围
+
+管理员目前**只是一个 `is_admin` 标记**，与普通用户的差别在于：
+
+- 普通用户：可提交、编辑、删除**自己**的镜像
+- 管理员：额外带 `is_admin = true`
+
+> **当前没有后台管理界面**（不提供封禁用户、删除他人仓库等操作）。
+> 这是有意的范围限定 —— 先保证「首个账号可用」，管理功能后续按需增加。
+
+### 5.4 与 GitHub OAuth 的关系
+
+两种登录方式**并存**，共用同一张 `users` 表：
+
+| 场景 | 行为 |
+|---|---|
+| 本地密码账号 | `password_hash` 有值，可走 `/api/v1/auth/password` 登录 |
+| 纯 OAuth 账号 | `password_hash` 为 NULL，**不能**用密码登录 |
+| 首次引导创建的管理员 | 使用本地密码 |
+
+因此**不使用 GitHub OAuth 也完全可用**：把 `[github]` 整段留空即可，
+引导创建的管理员通过用户名密码登录。
+
+> 迁移 `0003` 对既有数据完全兼容：老用户的 `password_hash` 为 NULL，
+> 登录行为不变。
 
 ---
 
 ## 六、Nginx 与 HTTPS
 
-`plants.md:482` 的配置**大体可用**，但有两处必须修正：
+`plants.md:482` 的配置**大体可用**，但有三处必须修正：
 
 | 问题 | `plants.md` 写法 | 修正 |
 |---|---|---|
-| 前端托管方式 | `root /var/www/boxli/frontend` + `try_files ... /index.html`（静态） | SSR 下应整段 `proxy_pass http://127.0.0.1:3000` |
+| 前端托管方式 | `root /var/www/boxli/frontend` + `try_files ... /index.html`（静态） | SSR 下不能走静态托管，应 `proxy_pass` 给应用 |
+| 反代目标 | 一条转后端、一条转前端（两个进程两个端口） | 单二进制下**合并为一条** `location /` → `127.0.0.1:3727` |
 | `/docs/` 目录 | `location /docs/ { root /var/www/boxli/docs; }` 指向独立静态目录 | **删除**。文档站就是 Nuxt 的 `/docs` 路由（`frontend/app/pages/docs/`），随 SSR 一起提供，没有独立静态目录 |
 
 `/etc/nginx/sites-available/boxli`：
@@ -404,8 +532,14 @@ server {
 
     client_max_body_size 2m;
 
-    # ===== API 反向代理（隐藏后端）=====
-    location /api/ {
+    # ===== 全部请求转给 boxli-hub（API + 静态资源 + SSR 都在里面）=====
+    #
+    # 单二进制架构下只需**一条 location**：
+    #   /api/*     → Go 原生处理
+    #   /_nuxt/*   → Go 从内嵌资源直接返回
+    #   其他       → Go 内部反代给 node 子进程做 SSR
+    # 旧版本需要的第二条指向 :3000 的 location 已不再需要。
+    location / {
         proxy_pass http://127.0.0.1:3727;
         proxy_http_version 1.1;
 
@@ -421,24 +555,11 @@ server {
         proxy_hide_header X-Powered-By;
     }
 
-    # ===== Nuxt SSR 前端（含 /docs）=====
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade           $http_upgrade;
-        proxy_set_header Connection        "upgrade";
-
-        proxy_read_timeout 60s;
-    }
-
-    # ===== 带 hash 的静态资源可长缓存 =====
+    # ===== 带内容 hash 的静态资源可长缓存 =====
+    # 文件名含 hash（如 entry.CTbtbonZ.css），内容变化必然换名，
+    # 因此可以安全地长期缓存。
     location /_nuxt/ {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:3727;
         proxy_set_header Host $host;
         expires 1y;
         add_header Cache-Control "public, immutable";
@@ -518,7 +639,7 @@ curl -m 5 http://<服务器公网IP>:5432   # 应超时
 sudo ufw status | grep -E '3727|5432'  # 应无输出
 ```
 
-### 8.3 前端
+### 8.3 前端（含 SSR / SEO 验证）
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" https://boxli.dev/          # 200
@@ -526,16 +647,62 @@ curl -s -o /dev/null -w "%{http_code}\n" https://boxli.dev/explore   # 200
 curl -s -o /dev/null -w "%{http_code}\n" https://boxli.dev/docs      # 200
 ```
 
-### 8.4 OAuth 全链路（最关键，必须人工点一次）
+**必须验证 SSR 确实生效**（这是 SEO 的根基）：
+
+```bash
+# 标题与描述必须出现在**服务端返回的 HTML** 里，而不是靠 JS 注入
+curl -s https://boxli.dev/ | grep -o '<title>[^<]*</title>'
+# 期望：<title>Boxli Hub · 轻量级容器引擎镜像索引</title>
+
+curl -s https://boxli.dev/ | grep -o '<meta name="description"[^>]*>' | head -1
+# 期望：能匹配到 content="..."
+
+# 文档站的 Markdown 也应是服务端渲染的（带锚点 id）
+curl -s https://boxli.dev/docs | grep -o 'id="[a-z0-9-]*"' | head -3
+```
+
+> 若 `<title>` 为空或 HTML 中看不到正文，说明 SSR 没生效
+> （浏览器 F12 看到的标题是 JS 执行后的结果，**不能**作为 SSR 生效的证据）。
+
+**静态资源由应用直接伺服**：
+
+```bash
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+  "https://boxli.dev$(curl -s https://boxli.dev/ | grep -o '/_nuxt/[A-Za-z0-9_.-]*\.css' | head -1)"
+# 期望：200 text/css
+```
+
+### 8.4 首次部署引导（首次上线必做）
+
+```bash
+# 1. 启动后查看日志中的引导令牌
+sudo journalctl -u boxli-hub -n 30 --no-pager | grep -A3 "首次部署引导"
+
+# 2. 无令牌访问应被拒绝（证明公网无法抢注）
+curl -s -X POST https://boxli.dev/api/v1/setup \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"guess","username":"attacker","password":"Attacker123!"}'
+# 期望：{"code":403,...}
+
+# 3. 用日志里的令牌在浏览器完成初始化
+#    https://boxli.dev/setup?token=<日志中的令牌>
+
+# 4. 用刚创建的账号登录，确认会话可用
+#    https://boxli.dev/login
+```
+
+### 8.5 OAuth 全链路（若启用了 GitHub 登录，必须人工点一次）
 
 1. 浏览器打开 `https://boxli.dev/login`
-2. 点登录 → 应跳转到 **GitHub 授权页**（若报 `redirect_uri_mismatch`，说明第 7 节的 callback URL 没同步）
+2. 点 GitHub 登录 → 应跳转到 **GitHub 授权页**（若报 `redirect_uri_mismatch`，说明第 7 节的 callback URL 没同步）
 3. 授权后应回到 `https://boxli.dev/dashboard`，且**显示已登录**
 4. 打开 DevTools → Application → Cookies，确认 `boxli_session` 存在且带 **`HttpOnly` + `Secure`** 标记
 5. 在 `/submit` 提交一个测试仓库，确认**写请求不被 403**（403 = `[site] frontend_url` 配错）
 
 > **第 3 步失败但第 2 步成功**，通常是 `[session] cookie_secure` 与协议不匹配，
 > 或 `[site] frontend_url` 域名与实际访问域名不一致（含 `www.` 前缀差异）。
+
+> 未启用 GitHub OAuth 时跳过本节，用 8.4 创建的本地账号验证登录与写操作即可。
 
 ### 8.5 CSRF 防线仍生效
 
@@ -755,8 +922,10 @@ sudo tail -f /var/log/nginx/error.log
 | **无请求 ID** | 日志仅 `log.Printf("%s %s", method, path)`（`server.go` 的 `withLogging`） | 无法串联单次请求的链路 |
 | **health 不探数据库** | `handleHealth` 恒返 `healthy` | 数据库挂了监控不会告警，需用 `/api/v1/repos` 替代探活 |
 | **无备份脚本** | 见[第九节](#九备份与恢复)自建 | 数据丢失无兜底 |
-| **无 CI/CD** | 仓库无任何 workflow / Makefile / Dockerfile | 构建与部署全手工 |
+| **无 CI/CD** | 仓库提供了 `Makefile`，但无 workflow / Dockerfile | 构建已可一条命令，但部署仍手工 |
 | **数据目录（原 `BOXLI_DATA_DIR`）** | 该字段为死代码，改造 TOML 时未迁移 | 无需设置；若未来接入 blob 存储需重新实现 |
+| **无后台管理界面** | 管理员仅有 `is_admin` 标记，不提供封禁/删除他人仓库的界面 | 见[5.3](#53-管理员权限范围)，属有意范围限定 |
+| **无改密码界面** | `localauth.SetPassword()` 已实现，但未暴露接口与页面 | 管理员改密码需暂用 SQL 或后续补接口 |
 | **阶段 6 手机端验收未完成** | Lighthouse Mobile、真机触控、iOS `100dvh` 等未实测 | 移动端体验未验收 |
 
 ---
@@ -766,8 +935,12 @@ sudo tail -f /var/log/nginx/error.log
 | 事项 | `plants.md` 原写法 | ✅ 正确做法 |
 |---|---|---|
 | 后端启动 | `boxli hub serve --addr ... --db ...` | `ExecStart=/usr/local/bin/boxli-hub --config /etc/boxli-hub/hub.toml` |
-| 前端形态 | 方式一 SSR / 方式二 SSG 二选一 | **只能 SSR**（`routeRules` 代理 + SSR 取数） |
-| 前端托管 | `root` + `try_files` 静态 | `proxy_pass http://127.0.0.1:3000` |
+| 前端形态 | 方式一 SSR / 方式二 SSG 二选一 | **只能 SSR**（SEO 依赖；SSG 下 `routeRules` 代理不存在） |
+| 前端部署 | 单独跑 `node .output/server/index.mjs` | **内嵌进二进制**，由主进程托管 node 子进程 |
+| 前端宿主 | `root` + `try_files` 静态 | `proxy_pass`（单二进制下并入 `location /`） |
+| systemd unit | 2 个（后端 + 前端） | **1 个**（`boxli-hub.service`） |
 | `/docs/` | 独立静态目录 `/var/www/boxli/docs` | 删除，随 Nuxt `/docs` 路由提供 |
-| 前端监听 | 未提 | 必须 `HOST=127.0.0.1`，否则暴露公网 |
+| 前端监听 | 必须 `HOST=127.0.0.1`，否则暴露公网 | 程序内部固定绑回环，**已无此配置失误可能** |
+| 构建命令 | 手工两步 | `make build`（内含正确顺序） |
+| 首次部署 | 未提 | 日志打印一次性令牌 → `/setup?token=...` 创建管理员 |
 | 端口排查 | （原文档误判） | `ss -ltnpe` 读 `uid:` / `cgroup:` |

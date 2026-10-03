@@ -37,40 +37,67 @@
 
 ## 一、架构总览
 
+> **2026-10-03 变更**：前端产物已内嵌进后端二进制，生产部署从「两进程」变为
+> 「一个进程」。下面的图是**当前**形态；旧形态（前端单独跑 `node`）见本节末尾说明。
+
 ```
 用户浏览器
     │
     ▼
-┌─────────────────────────────────┐
-│  Nginx (80/443)                 │  ← 生产环境
-│  /api/*  → 反代到后端            │
-│  其余路径 → 前端 (Nuxt SSR)      │
-│           （/docs 也是 Nuxt 路由）│
-└──────────────┬──────────────────┘
+┌──────────────────────────────────────────────┐
+│  Nginx (80/443)                              │  ← 生产环境
+│  location /  → 全部反代到 127.0.0.1:3727      │    （只有一条 location）
+└──────────────┬───────────────────────────────┘
                │ 127.0.0.1:3727（仅回环，外部不可达）
                ▼
-┌─────────────────────────────────┐
-│  Boxli Hub 后端 (Go)             │  只存元数据，不存镜像文件
-└──────────────┬──────────────────┘
+┌──────────────────────────────────────────────┐
+│  boxli-hub（单个 Go 二进制）                  │
+│   ├─ /api/*    Go 原生处理（只存元数据）       │
+│   ├─ /_nuxt/*  go:embed 的静态资源，直接返回   │
+│   └─ 其他      反向代理 → node 子进程做 SSR    │
+│                        │                      │
+│                        ▼                      │
+│              node（内嵌 bundle 释放到临时目录） │
+│              端口由内核随机分配，仅绑 127.0.0.1 │
+└──────────────┬───────────────────────────────┘
                │ 127.0.0.1:5432（仅回环）
                ▼
-┌─────────────────────────────────┐
-│  PostgreSQL 17                  │  users / repositories / tags / sources / sessions / oauth_states
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  PostgreSQL 17                                │
+│  users / repositories / tags / sources /      │
+│  sessions / oauth_states / schema_migrations  │
+└──────────────────────────────────────────────┘
 
 镜像文件本体：用户自己的 GitHub / Gitee / OSS / S3 / IPFS / BT …
 Hub 只记录「去哪下载」
 ```
 
+**为什么要托管 node 子进程而不是消灭它：**
+
+| 尝试 | 结论 |
+|---|---|
+| 用纯 Go 引擎（goja）执行 Nitro 产物 | ❌ 实测在打包产物的**第一个正则字面量**上 panic（不支持 ES2020+ 的 `\u{...}` 语法） |
+| Node SEA（`--experimental-sea-config`） | ❌ 实测 blob 仅 429 字节，`main` 只是路径引用，不内联依赖 |
+| 改 `ssr: false` 走纯 SPA | ❌ 丢失 SEO（首屏空壳，`<title>`/描述靠 JS 注入） |
+| **esbuild 打包 + Go 托管 node 子进程** | ✅ 实测可行：单文件 3.4→15.2 MB，空目录独立运行 |
+
+因此**保留 node 作为运行时依赖**，但前端**产物**完全内嵌，部署无需任何外部前端文件。
+
 **核心约束：**
 
 | 约束 | 说明 |
 |---|---|
-| 前后端完全分离 | 开发期前端经 Nuxt `routeRules` 同源代理 `/api/**`；生产经 Nginx 反代 |
+| 单进程部署 | 前端产物内嵌，node 由主进程托管；不再需要第二个 systemd 服务 |
 | 后端仅监听回环 | `127.0.0.1:3727`，端口扫描不可见 |
+| SSR 子进程仅监听回环 | 端口由内核随机分配，程序内部固定绑 `127.0.0.1` |
 | 数据库仅监听回环 | `127.0.0.1:5432` |
 | 不存储镜像本体 | `sources.url` 只记录外链地址 |
+| **必须保留 SSR** | 生产依赖服务端渲染的 HTML 做 SEO；`--no-ssr` 仅供应急排查 |
 | 手机优先 | 先写 <640px，再 `md:`/`lg:`（要点见 [6.6](#66-手机优先实现要点)） |
+
+> **开发期仍是前后端分离**：本地 `make dev-frontend` + `make dev-backend`，
+> 前端经 Nuxt `routeRules` 同源代理 `/api/**`，享受热更新。
+> 内嵌只发生在**构建产物**中，不影响日常开发体验。
 
 ---
 
@@ -91,6 +118,8 @@ internal/
 │   ├── cookie.go            # httpOnly 会话 Cookie 下发/清除/提取
 │   ├── origin.go            # CSRF 来源白名单校验
 │   ├── state.go             # OAuth state 一次性校验（DELETE ... RETURNING）
+│   ├── setup_token.go       # 首次引导令牌：随机生成 + 恒定时间比较
+│   ├── setup_token_test.go
 │   ├── state_test.go        # state 单次消费 / 伪造 / 过期
 │   └── origin_test.go       # 来源校验 + Cookie 属性测试
 ├── config/config.go         # TOML 配置加载 + 启动期校验（hub.toml）
@@ -99,15 +128,28 @@ internal/
 │   ├── db.go                # pgxpool 连接池 + go:embed 迁移执行器
 │   └── migrations/
 │       ├── 0001_init.sql    # 5 张业务表 + 索引
-│       └── 0002_oauth_states.sql
+│       ├── 0002_oauth_states.sql
+│       └── 0003_local_auth.sql  # password_hash / is_admin / 用户名唯一索引
 ├── hub/
-│   ├── server.go            # 路由分发 + 中间件链 + 统一响应封装 + CORS
+│   ├── server.go            # 路由分发 + 中间件链 + 统一响应 + CORS + 前端挂载
 │   ├── store.go             # 读查询：search / listRepos / getRepo / readme
 │   ├── store_write.go       # 写事务：create / update / delete（整体替换语义）
 │   ├── handlers_read.go     # 读接口处理器
 │   ├── handlers_write.go    # 写接口处理器
 │   ├── handlers_auth.go     # 登录/回调/me/登出 + upsertUser + 回跳与 Cookie
-│   └── redirect_test.go     # 开放重定向防护测试
+│   ├── handlers_password.go # 本地用户名 + 密码登录
+│   ├── handlers_setup.go    # 首次部署引导（页面 + 创建管理员）
+│   ├── redirect_test.go     # 开放重定向防护测试
+│   └── setup_test.go        # 引导页/令牌校验行为测试
+├── localauth/
+│   ├── localauth.go         # bcrypt 哈希、密码/用户名校验、首个管理员创建
+│   └── localauth_test.go
+├── web/                     # 前端内嵌与 SSR 子进程托管
+│   ├── web.go               # go:embed all:dist + 释放 bundle + 启动/守护/清理 node
+│   ├── embed_check_test.go  # 守住 all: 前缀（防止静态资源静默丢失）
+│   └── dist/                # 构建产物（gitignore；由 make frontend 生成）
+│       ├── ssr.mjs          #   esbuild 打包的 SSR 单文件
+│       └── public/          #   客户端静态资源（含 _nuxt/）
 └── seed/seed.go             # 种子数据定义
 ```
 
@@ -397,6 +439,50 @@ RETURNING id, username
 > **⚠️ 绝不能在冲突时「按 username 退化查找并登录」** —— 那会让新 GitHub 账号
 > 接管同名老账号（账号接管漏洞）。这是已修复的 L7。
 
+### 5.10 本地密码认证（`internal/localauth`）
+
+与 GitHub OAuth **并存**，共用 `users` 表：`password_hash` 为 NULL 的账号只能走 OAuth，
+反之亦然。
+
+| 关注点 | 做法 |
+|---|---|
+| 存储 | `bcrypt`（`golang.org/x/crypto`），加盐哈希，不可逆 |
+| 用户枚举防护 | 「用户不存在」与「密码错误」返回**同一错误**，且账号不存在时**仍执行一次 bcrypt 比较**，拉平响应耗时 |
+| 用户名规则 | 3–32 字符，仅 ASCII 字母/数字/`_`/`-`（避免 URL 路径与日志歧义）|
+| 密码规则 | ≥8 字符、≤72 **字节**（bcrypt 只取前 72 字节，超出会静默截断）、拒绝常见弱口令 |
+| 密码比对 | `bcrypt.CompareHashAndPassword`（内部为恒定时间比较）|
+
+> **为什么限制 72 字节**：bcrypt 静默忽略第 72 字节之后的内容。若不限制，
+> 用户会以为超长密码更安全，实际强度等同截断后的前缀。
+
+### 5.11 首次部署引导（`/setup`）
+
+当 `users` 表为空时，启动流程生成一次性令牌并打印到**服务端日志**：
+
+```go
+setupToken, _ := auth.NewSetupToken()           // 32 字节随机 → 64 位十六进制
+userCount, _ := localauth.NewStore(pool).UserCount(ctx)
+if userCount == 0 {
+    srv.EnableSetup(setupToken)
+    log.Printf("请在浏览器打开： http://<域名>/setup?token=%s", setupToken)
+}
+```
+
+**三重防护**（对应 `handlers_setup.go`）：
+
+| 防护 | 实现 | 防的是什么 |
+|---|---|---|
+| 一次性令牌 | `auth.ConstantTimeEqual(token, got)` | 公网用户抢先注册管理员 |
+| 仅无用户时可用 | `CreateFirstAdmin` 在同一事务内 `SELECT COUNT(*)` 后再插入 | 并发请求创建出多个管理员；初始化后被重放 |
+| 恒定时间比较 | `subtle.ConstantTimeCompare` | 逐字节推断令牌的时序侧信道 |
+
+设计取舍：
+
+- **引导页是内嵌的自包含 HTML**，不走 Nuxt。因为引导发生时前端可能尚未正确配置
+  （`frontend_url` 可能还是默认值），依赖 SPA 会让「首次部署」这一最需要可靠的环节变脆弱。
+- **令牌只出现在日志里**，不写入数据库也不返回给前端 —— 能看到日志即证明对该服务器有控制权。
+- 初始化成功后**立即调用 `invalidateSetupToken()`**，并因 `users` 非空而永久关闭接口。
+
 ---
 
 ## 六、前端实现
@@ -590,7 +676,128 @@ function commit(next: SourceRow[]) {
 
 ---
 
+## 七bis、前端内嵌与 SSR 子进程托管
+
+这是「单二进制部署」的实现所在，涉及 `internal/web` 与 `frontend/scripts`。
+
+### 构建管线
+
+```
+frontend/app/**                        源码
+      │  nuxt build
+      ▼
+frontend/.output/
+      ├── public/           客户端资源（_nuxt/*.js|css）
+      └── server/           Nitro SSR 服务 + node_modules（约 19MB）
+                │  esbuild --bundle
+                ▼
+backend/internal/web/dist/
+      ├── public/           直接拷贝，Go 用 http.FileServer 伺服
+      └── ssr.mjs           单文件（15.2MB / gzip 2.0MB，已内联全部依赖）
+                │  go:embed all:dist
+                ▼
+backend/boxli-hub（33MB 单二进制）
+```
+
+### 为什么必须用 `go:embed all:`
+
+Go 的 `go:embed` **默认忽略**以 `.` 或 `_` 开头的目录与文件，
+而 Nuxt 的静态资源目录恰好是 **`_nuxt/`**。
+
+```go
+//go:embed all:dist      // ✅ 正确：包含 _nuxt/
+//go:embed dist          // ❌ 静态资源全部丢失，且编译期不报错
+var assets embed.FS
+```
+
+`internal/web/embed_check_test.go` 专门守这一点：断言嵌入的文件数非零且存在 `_nuxt` 目录，
+防止有人把 `all:` 前缀改掉后只在运行时才发现 404。
+
+> 顺带说明：若 `dist/` **整体缺失**，`go build` 会报
+> `pattern all:dist: no matching files found` —— 这是有意保留的失败方式，
+> 比静默产出一个前端不可用的二进制要好。
+
+### SSR 子进程生命周期
+
+`web.StartSSR()` 的步骤：
+
+1. 读取内嵌的 `ssr.mjs`
+2. `os.MkdirTemp`（权限 0700）→ 写入 `ssr.mjs`
+3. `net.Listen("tcp","127.0.0.1:0")` 取一个空闲端口后立即关闭，把端口交给 node
+4. 启动 node 子进程，注入 `NITRO_PORT` / `NITRO_HOST=127.0.0.1` / `NODE_ENV=production`
+5. 轮询该端口直到可连接（最多 30 秒），就绪后返回反向代理
+
+**`SysProcAttr` 的两个关键设置**：
+
+| 设置 | 作用 |
+|---|---|
+| `Setpgid: true` | 独立进程组。退出时用 `kill(-pid, SIGTERM)` 连带清理 node 派生的子进程 |
+| `Pdeathsig: SIGTERM` | **内核级**兜底：主进程被 `SIGKILL` 或崩溃时，node 自动终止 |
+
+> **`Pdeathsig` 是实测补上的**：只靠 `defer ssr.Stop()` 时，若主进程被 `SIGKILL`
+> （来不及执行 defer），node 会变成 `PPID=1` 的孤儿并持续占用端口与内存。
+> 加 `Pdeathsig` 后实测：`kill -9` 主进程，node 子进程随之消失。
+
+`Stop()` 的清理顺序：SIGTERM 整个进程组 → 等 5 秒 → SIGKILL → 删除临时目录。
+可安全重复调用（有 `stopped` 标志）。
+
+### 路由挂载顺序
+
+`server.go` 的 `mountFrontend()` 把前端挂在**最后**：
+
+```go
+mux.HandleFunc("/api/v1/...", ...)      // 更具体的模式
+mux.Handle("/_nuxt/", fileServer)       // 静态资源
+mux.HandleFunc("/", ssrOrFallback)      // 兜底 → SSR
+```
+
+Go 1.22+ 的 `ServeMux` 按**模式具体程度**优先匹配，因此 `/api/v1/*` 不会被 `/` 吞掉。
+
+> **一个曾踩到的坑**：`/_nuxt/` 的 handler **不能**用 `http.StripPrefix`。
+> `web.Assets()` 返回的文件系统根对应 `dist/public`，其下**就包含 `_nuxt/`**，
+> 所以 URL 路径可直接映射；StripPrefix 会让它去找根下的 `entry.css` 而 404。
+
+### 打包时解决的三个 jsdom 兼容问题
+
+`isomorphic-dompurify` 在 Node 条件下 `import { JSDOM } from 'jsdom'`，
+而 jsdom 是 CommonJS 且有运行时文件依赖。esbuild 打成 ESM 后会连续出错：
+
+| 报错 | 原因 | 解法（`frontend/scripts/`） |
+|---|---|---|
+| `Dynamic require of "node:fs" is not supported` | jsdom 用动态 require | 注入 `createRequire` 兼容层（`--banner:js`） |
+| `ReferenceError: __dirname is not defined` | esbuild 不提供 CJS 全局量 | 同上的 banner 里补 `__filename`/`__dirname` |
+| `ENOENT ... /default-stylesheet.css` | jsdom 用 `__dirname` 相对路径读文件 | 插件把它**内联为字符串常量** |
+| `Cannot find module './xhr-sync-worker.js'` | `require.resolve` 的文件未被打出 | 插件替换为占位（仅同步 XHR 用，DOMPurify 不用 XHR） |
+
+> 这些兼容层集中放在 `frontend/scripts/plugins/jsdom-inline-stylesheet.mjs`，
+> 并用**精确正则匹配**源码：若 jsdom 升级导致语句形式变化，插件会**直接报错**
+> 而不是静默失效。
+
+### 开发模式 vs 生产模式
+
+| | 开发 | 生产（单二进制） |
+|---|---|---|
+| 前端进程 | `nuxt dev`（热更新） | 内嵌 bundle，由主进程托管 |
+| API 路径 | Nuxt `routeRules` 代理 → 3727 | Go 原生处理 |
+| 端口 | 3011（勿用 3000，见 README） | 仅 3727 |
+| `frontend_url` | `http://localhost:3011` | `https://boxli.dev` |
+
+---
+
 ## 八、本地开发与调试
+
+> **推荐用 Makefile**，因为它固化了「先前端后后端」的顺序：
+>
+> ```bash
+> make build          # 前端打包 + 后端内嵌（生产形态）
+> make dev-backend    # 本地起后端
+> make dev-frontend   # 本地起前端（3011）
+> make test / vet / clean
+> make help           # 列出全部目标
+> ```
+>
+> ⚠️ 直接 `cd backend && go build` 时，若 `internal/web/dist/` 尚未生成，
+> 编译会报 `pattern all:dist: no matching files found`。先 `make frontend`。
 
 ### 8.1 后端
 
@@ -606,6 +813,9 @@ go run ./cmd/seed    # 种子数据（幂等）
 ```
 
 > 沙箱不允许写 `~/.cache` 与 `~/go`，故 Go 缓存必须指向工作区内。
+
+> `go run ./cmd/hub` 会**同时启动 SSR 子进程**（因为内嵌前端始终存在）。
+> 若只想调后端 API，加 `--no-ssr` 跳过前端，可省下约 15MB 的内存与启动时间。
 
 ### 8.2 前端
 

@@ -1,0 +1,210 @@
+name: Build
+
+# 构建适用于 Linux amd64 的单个二进制并发布。
+#
+# 产物 boxli-hub 是**自包含**的：前端产物（SSR bundle + 静态资源）已通过
+# go:embed 内嵌进二进制，部署时只需「二进制 + hub.toml + PostgreSQL」。
+#
+# 触发方式：
+#   - push 到 main / 打 tag：构建并上传 artifact
+#   - 打 v* tag：额外创建 GitHub Release 并附上二进制
+#   - 手动触发：Actions 页面点 "Run workflow"
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的旧构建自动取消，避免浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 先跑测试，失败就不产二进制
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # 与 backend/go.mod 的 `go 1.27` 保持一致
+          go-version: '1.27'
+          cache-dependency-path: backend/go.sum
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: go test
+        working-directory: backend
+        # 部分测试需要数据库；连不上会自动 skip（见 DEVELOPMENT.md），
+        # 因此这里不配置 PostgreSQL 也能跑通核心用例。
+        run: go test ./... -v
+
+  # ---------------------------------------------------------------------------
+  # 构建：先前端（Nuxt + esbuild 打包），再后端（内嵌前端产物）
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build linux/amd64
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          # 本地实测环境为 v24.21.0；前端产物需要 Node 20+
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # ⚠️ 顺序不能颠倒：go:embed 在**编译期**读取 backend/internal/web/dist。
+      # 该目录被 gitignore（属构建产物），必须先由前端构建生成。
+      # 若缺失，go build 会报 "pattern all:dist: no matching files found"。
+      - name: Build frontend (Nuxt + esbuild SSR bundle)
+        working-directory: frontend
+        run: npm run build && npm run build:ssr-bundle
+        env:
+          NODE_ENV: production
+
+      # 守住 go:embed all: 前缀：若 _nuxt/ 未被嵌入，这里会失败，
+      # 而不是等到部署后才发现静态资源全 404。
+      - name: Verify embedded assets
+        working-directory: backend
+        run: go test ./internal/web/ -run 'TestEmbed|TestSSRBundle' -v
+
+      - name: Build backend binary
+        working-directory: backend
+        env:
+          # 静态链接，便于在任何 Linux 发行版运行
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.buildVersion=${GITHUB_REF_NAME} -X main.buildCommit=${GITHUB_SHA::8}" \
+            -o ../dist/boxli-hub \
+            ./cmd/hub
+
+      - name: Verify binary
+        run: |
+          set -euo pipefail
+          file dist/boxli-hub
+          ls -lh dist/boxli-hub
+          # 确认是静态链接的可执行文件
+          if ldd dist/boxli-hub 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            echo "✓ 静态链接"
+          else
+            echo "::error::二进制不是静态链接"
+            ldd dist/boxli-hub || true
+            exit 1
+          fi
+          # 确认前端产物确实被嵌入了（体积应显著大于纯后端）
+          SIZE=$(stat -c%s dist/boxli-hub)
+          if [ "$SIZE" -lt 20000000 ]; then
+            echo "::error::二进制仅 $SIZE 字节，前端产物可能未被嵌入"
+            exit 1
+          fi
+          echo "✓ 体积 $SIZE 字节，前端产物已嵌入"
+
+      # 附带一份配置示例，方便直接部署
+      - name: Prepare release bundle
+        run: |
+          cp backend/hub.toml.example dist/hub.toml.example
+          cd dist && sha256sum boxli-hub > boxli-hub.sha256
+
+      - name: Smoke test (optional)
+        # 二进制启动需要可用的 PostgreSQL，CI 中没有数据库，
+        # 因此只验证「能执行且能打印帮助/版本」，不启动服务。
+        run: |
+          chmod +x dist/boxli-hub
+          ./dist/boxli-hub --help 2>&1 | head -20 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: boxli-hub-linux-amd64
+          path: |
+            dist/boxli-hub
+            dist/boxli-hub.sha256
+            dist/hub.toml.example
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 打 tag 时创建 Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: boxli-hub-linux-amd64
+          path: dist
+
+      - name: Show contents
+        run: ls -lh dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/boxli-hub
+            dist/boxli-hub.sha256
+            dist/hub.toml.example
+          generate_release_notes: true
+          body: |
+            ## Boxli Hub ${{ github.ref_name }} (linux/amd64)
+
+            **自包含单二进制**：前端产物（SSR + 静态资源）已内嵌，部署只需本二进制、
+            一个 `hub.toml` 与 PostgreSQL。
+
+            ### 部署步骤
+
+            1. 下载 `boxli-hub` 与 `hub.toml.example`
+            2. `cp hub.toml.example hub.toml` 并按需修改（数据库、域名、jwt_secret）
+            3. 运行 `./boxli-hub --config hub.toml`
+            4. **首次启动**会在日志打印一次性引导令牌，浏览器打开
+               `https://<你的域名>/setup?token=<令牌>` 创建管理员
+
+            ### 运行时依赖
+
+            - **Node.js**（必需）：服务端渲染靠 Node 执行，用于保证 SEO
+            - PostgreSQL：数据库
+
+            ### 校验
+
+            ```bash
+            sha256sum -c boxli-hub.sha256
+            ```
+
+            详细说明见 [DEPLOYMENT.md](https://github.com/${{ github.repository }}/blob/main/DEPLOYMENT.md)。

@@ -29,12 +29,13 @@ const DefaultPath = "hub.toml"
 // File 与 hub.toml 一一对应。指针字段用于区分「未写」与「显式写了零值」：
 // 未写取默认值，写了就用写的那个（哪怕它是 false / 0）。
 type File struct {
-	Server  ServerSection  `toml:"server"`
-	DB      DBSection      `toml:"db"`
-	Session SessionSection `toml:"session"`
-	GitHub  GitHubSection  `toml:"github"`
-	Site    SiteSection    `toml:"site"`
-	Dev     DevSection     `toml:"dev"`
+	Server   ServerSection   `toml:"server"`
+	DB       DBSection       `toml:"db"`
+	Session  SessionSection  `toml:"session"`
+	GitHub   GitHubSection   `toml:"github"`
+	Site     SiteSection     `toml:"site"`
+	Frontend FrontendSection `toml:"frontend"`
+	Dev      DevSection      `toml:"dev"`
 }
 
 type ServerSection struct {
@@ -81,6 +82,15 @@ type DevSection struct {
 	Enabled bool `toml:"enabled"`
 }
 
+// FrontendSection 控制内嵌前端（SSR 子进程）的行为。
+type FrontendSection struct {
+	// NodePath 是 node 可执行文件路径；留空则在 PATH 中查找 "node"。
+	NodePath string `toml:"node_path"`
+	// AllowMissingNode 为 true 时，找不到 node 不阻断启动，仅提供静态资源。
+	// 默认 false：宁可启动失败，也不要静默降级成无服务端渲染（SEO 受损）的站点。
+	AllowMissingNode *bool `toml:"allow_missing_node"`
+}
+
 // ---------------------------------------------------------------------------
 // 运行时配置
 // ---------------------------------------------------------------------------
@@ -100,6 +110,10 @@ type Config struct {
 	FrontendURL  string
 	CookieSecure bool
 	ExtraOrigins []string
+
+	// NodePath / AllowMissingNode 控制内嵌 SSR 前端（见 FrontendSection）。
+	NodePath         string
+	AllowMissingNode bool
 
 	DevLogin bool
 
@@ -218,6 +232,11 @@ func (c *Config) apply(f File) {
 	c.ExtraOrigins = f.Site.ExtraOrigins
 
 	c.DevLogin = f.Dev.Enabled
+
+	c.NodePath = strings.TrimSpace(f.Frontend.NodePath)
+	if f.Frontend.AllowMissingNode != nil {
+		c.AllowMissingNode = *f.Frontend.AllowMissingNode
+	}
 }
 
 // normalize 做 trim、补默认值与合法性校验。

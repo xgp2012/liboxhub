@@ -4,9 +4,20 @@ node_modules/
 .output/
 dist/
 
+# ---- 内嵌进后端二进制的前端产物 ----
+# 由 `make frontend`（nuxt build + esbuild 打包）生成，体积约 16MB，
+# 属于**构建中间产物**，不进仓库。
+#
+# 拉取代码后必须先执行 `make frontend`（或直接 `make build`）再编译后端。
+# 若该目录缺失，go:embed 会在**编译期**报错
+# （"pattern all:dist: no matching files found"），不会静默嵌入空内容。
+backend/internal/web/dist/
+
 # ---- Go 构建产物 ----
 backend/hub
 backend/hub.exe
+# 主二进制（make build 的产物）
+backend/boxli-hub
 backend/bin/
 backend/data/
 
