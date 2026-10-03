@@ -7,7 +7,8 @@
 # 启动：
 #   ./boxli-hub                      # 读取当前目录的 hub.toml
 #   ./boxli-hub --config /etc/boxli-hub/hub.toml
-#   ./boxli-hub --no-ssr             # 不启动 SSR 前端（仅静态资源，会损失 SEO）
+#   ./boxli-hub --no-ssr             # 仅排查：不启动 SSR（页面将返回 503）
+#   ./boxli-hub --version            # 打印版本与 commit
 #
 # 说明：
 #   - 配置文件是唯一的配置来源，程序不读取任何环境变量。

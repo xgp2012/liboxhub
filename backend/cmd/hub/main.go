@@ -34,7 +34,7 @@ func main() {
 	configPath := flag.String("config", config.DefaultPath,
 		"TOML 配置文件路径")
 	noSSR := flag.Bool("no-ssr", false,
-		"不启动 SSR 前端（只提供内嵌静态资源，页面将无服务端渲染）")
+		"不启动 SSR 前端：只提供 API 与静态资源，页面请求返回 503（用于排查问题）")
 	showVersion := flag.Bool("version", false,
 		"打印版本信息后退出")
 	flag.Parse()

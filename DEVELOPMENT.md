@@ -1,231 +1,150 @@
 # Boxli Hub 开发文档
 
-> 面向开发者的**技术实现说明**：架构、模块职责、认证实现、API 细节、调试与安全设计。
->
-> 本文档描述**当前代码的实际实现**，并明确标注哪些行为已被实测验证、哪些仅做过静态检查。
+面向**改这个仓库的人**：讲清楚代码长什么样、为什么这么写、以及容易踩的地方。
 
-## 文档分工
-
-| 文档 | 回答什么问题 | 受众 |
-|---|---|---|
-| [`README.md`](./README.md) | **怎么把它跑起来** —— 环境准备、启动步骤、配置字段、API 简表 | 初次接触项目的人 |
-| 本文档 | **它是怎么实现的** —— 架构、设计理由、实现细节、调试与测试 | 改代码的人 |
-| [`DEPLOYMENT.md`](./DEPLOYMENT.md) | **怎么上线** —— 构建、systemd、Nginx、HTTPS、备份 | 运维 / 部署者 |
-| [`plants.md`](./plants.md) | 立项时的分阶段计划 | **历史存档，仅作考据** |
-
-> **⚠️ `plants.md` 含已被推翻的规格**（错误的 systemd `ExecStart`、SSG 方案、`:3000` 端口
-> 误判等），**不作为现行依据**。本文档与 `DEPLOYMENT.md` 描述的是实际实现，
-> 冲突时以那两者为准。
+- 想跑起来、想部署 → 见 [`README.md`](./README.md)
+- 想上线 → 见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)
 
 ---
 
 ## 目录
 
-1. [架构总览](#一架构总览)
-2. [目录与模块职责](#二目录与模块职责)
-3. [数据模型](#三数据模型)
-4. [后端实现](#四后端实现)
-5. [认证与会话](#五认证与会话)
-6. [前端实现](#六前端实现)
-7. [API 参考](#七api-参考)
-8. [本地开发与调试](#八本地开发与调试)
-9. [测试与验证](#九测试与验证)
-10. [安全设计汇总](#十安全设计汇总)
-11. [已知限制与后续工作](#十一已知限制与后续工作)
+- [一、技术栈与架构](#一技术栈与架构)
+- [二、代码结构](#二代码结构)
+- [三、数据模型](#三数据模型)
+- [四、后端实现](#四后端实现)
+- [五、认证与会话](#五认证与会话)
+- [六、前端实现](#六前端实现)
+- [七、前端内嵌与 SSR 托管](#七前端内嵌与-ssr-托管)
+- [八、API 参考](#八api-参考)
+- [九、本地开发](#九本地开发)
+- [十、测试](#十测试)
+- [十一、安全设计](#十一安全设计)
+- [十二、已知限制](#十二已知限制)
 
 ---
 
-## 一、架构总览
+## 一、技术栈与架构
 
-> **2026-10-03 变更**：前端产物已内嵌进后端二进制，生产部署从「两进程」变为
-> 「一个进程」。下面的图是**当前**形态；旧形态（前端单独跑 `node`）见本节末尾说明。
+| 部分 | 选型 |
+|---|---|
+| 前端 | Nuxt 4 + fuxsto-design + Tailwind CSS v4 |
+| 后端 | Go（标准库 `net/http`）+ pgx/v5 |
+| 数据库 | PostgreSQL 17 |
+| 认证 | GitHub OAuth **与** 本地密码（bcrypt）并存 |
+| 部署 | **单个二进制**（前端产物 `go:embed` 内嵌） |
+
+### 运行时拓扑（生产）
 
 ```
-用户浏览器
-    │
-    ▼
-┌──────────────────────────────────────────────┐
-│  Nginx (80/443)                              │  ← 生产环境
-│  location /  → 全部反代到 127.0.0.1:3727      │    （只有一条 location）
-└──────────────┬───────────────────────────────┘
-               │ 127.0.0.1:3727（仅回环，外部不可达）
-               ▼
-┌──────────────────────────────────────────────┐
-│  boxli-hub（单个 Go 二进制）                  │
-│   ├─ /api/*    Go 原生处理（只存元数据）       │
-│   ├─ /_nuxt/*  go:embed 的静态资源，直接返回   │
-│   └─ 其他      反向代理 → node 子进程做 SSR    │
-│                        │                      │
-│                        ▼                      │
-│              node（内嵌 bundle 释放到临时目录） │
-│              端口由内核随机分配，仅绑 127.0.0.1 │
-└──────────────┬───────────────────────────────┘
-               │ 127.0.0.1:5432（仅回环）
-               ▼
-┌──────────────────────────────────────────────┐
-│  PostgreSQL 17                                │
-│  users / repositories / tags / sources /      │
-│  sessions / oauth_states / schema_migrations  │
-└──────────────────────────────────────────────┘
-
-镜像文件本体：用户自己的 GitHub / Gitee / OSS / S3 / IPFS / BT …
-Hub 只记录「去哪下载」
+浏览器 ──HTTPS──> Nginx
+                    │ 全部请求
+                    ▼
+          127.0.0.1:3727  boxli-hub（唯一进程）
+                    ├── /api/*     Go 原生处理
+                    ├── /_nuxt/*   go:embed 的静态资源
+                    └── 其他        反代 → node 子进程（SSR，随机回环端口）
+                                        │
+                                        ▼
+                                   PostgreSQL 127.0.0.1:5432
 ```
 
-**为什么要托管 node 子进程而不是消灭它：**
+**一个进程，两种执行环境。** 前端产物内嵌在 Go 二进制里，但 SSR 仍需由 Node 执行
+（Go 无法跑 JavaScript）。所以主进程会拉起一个 node 子进程并在内部反代给它。
+详见[第七节](#七前端内嵌与-ssr-托管)。
 
-| 尝试 | 结论 |
+### 为什么保留 SSR
+
+`index.vue`、`explore/index.vue`、`explore/[ns]/[repo].vue`、`search.vue` 四页
+在**服务端**取数（`await useRepoList()` 等），HTML 里就有真实内容和 `<title>`、
+`<meta name="description">` —— 这是 SEO 的基础。
+
+纯 SPA（`ssr: false`）会让首屏变成空壳、SEO 归零，因此**否决**。
+SSG 也不可行：`nuxt.config.ts` 的 `routeRules` 代理是 Nitro **运行时**行为，
+静态导出后不存在。**结论：必须 SSR。**
+
+### 关键约束
+
+| 约束 | 原因 |
 |---|---|
-| 用纯 Go 引擎（goja）执行 Nitro 产物 | ❌ 实测在打包产物的**第一个正则字面量**上 panic（不支持 ES2020+ 的 `\u{...}` 语法） |
-| Node SEA（`--experimental-sea-config`） | ❌ 实测 blob 仅 429 字节，`main` 只是路径引用，不内联依赖 |
-| 改 `ssr: false` 走纯 SPA | ❌ 丢失 SEO（首屏空壳，`<title>`/描述靠 JS 注入） |
-| **esbuild 打包 + Go 托管 node 子进程** | ✅ 实测可行：单文件 3.4→15.2 MB，空目录独立运行 |
-
-因此**保留 node 作为运行时依赖**，但前端**产物**完全内嵌，部署无需任何外部前端文件。
-
-**核心约束：**
-
-| 约束 | 说明 |
-|---|---|
-| 单进程部署 | 前端产物内嵌，node 由主进程托管；不再需要第二个 systemd 服务 |
-| 后端仅监听回环 | `127.0.0.1:3727`，端口扫描不可见 |
-| SSR 子进程仅监听回环 | 端口由内核随机分配，程序内部固定绑 `127.0.0.1` |
-| 数据库仅监听回环 | `127.0.0.1:5432` |
-| 不存储镜像本体 | `sources.url` 只记录外链地址 |
-| **必须保留 SSR** | 生产依赖服务端渲染的 HTML 做 SEO；`--no-ssr` 仅供应急排查 |
-| 手机优先 | 先写 <640px，再 `md:`/`lg:`（要点见 [6.6](#66-手机优先实现要点)） |
-
-> **开发期仍是前后端分离**：本地 `make dev-frontend` + `make dev-backend`，
-> 前端经 Nuxt `routeRules` 同源代理 `/api/**`，享受热更新。
-> 内嵌只发生在**构建产物**中，不影响日常开发体验。
+| 只存元数据 | `sources.url` 只记录「去哪下载」，不存镜像文件 |
+| 只绑回环 | 后端、SSR 子进程、数据库都只听 `127.0.0.1`，对外由 Nginx 暴露 |
+| 无环境变量 | 配置只来自 TOML（`--config` 指定路径） |
+| 手机优先 | 先写 <640px，再 `md:`/`lg:` |
 
 ---
 
-## 二、目录与模块职责
-
-### 后端 `backend/`
+## 二、代码结构
 
 ```
-cmd/
-├── hub/main.go              # 服务入口：加载配置 → 连库 → 迁移 → 监听 → 优雅关闭
-└── seed/main.go             # 种子数据入口（幂等，可重复执行）
+backend/
+├── cmd/hub/                    # 服务入口（唯一进程）
+├── cmd/seed/                   # 种子数据（幂等）
+└── internal/
+    ├── auth/                   # 会话与 CSRF
+    │   ├── auth.go             #   JWT 签发/校验 + sessions 表（存 sid 的 SHA-256）
+    │   ├── github.go           #   OAuth：authorize URL / code 换 token / 拉用户
+    │   ├── middleware.go       #   鉴权中间件：解析会话 → 注入 context
+    │   ├── cookie.go           #   httpOnly 会话 Cookie
+    │   ├── origin.go           #   CSRF 来源白名单
+    │   ├── state.go            #   OAuth state 一次性校验
+    │   └── setup_token.go      #   首次引导令牌（随机 + 恒定时间比较）
+    ├── config/config.go        # TOML 加载 + 启动期校验
+    ├── db/
+    │   ├── db.go               # pgxpool + go:embed 迁移执行器
+    │   └── migrations/         # 0001_init / 0002_oauth_states / 0003_local_auth
+    ├── hub/                    # HTTP 层
+    │   ├── server.go           #   路由 + 中间件链 + 响应封装 + 前端挂载
+    │   ├── store.go            #   读查询
+    │   ├── store_write.go      #   写事务（整体替换语义）
+    │   ├── handlers_read.go    #   读接口
+    │   ├── handlers_write.go   #   写接口
+    │   ├── handlers_auth.go    #   登录/回调/me/登出
+    │   ├── handlers_password.go#   本地密码登录
+    │   └── handlers_setup.go   #   首次部署引导
+    ├── localauth/localauth.go  # bcrypt 校验 + 首个管理员创建
+    ├── seed/seed.go            # 种子数据定义
+    └── web/                    # 前端内嵌与 node 子进程托管
+        ├── web.go              #   go:embed all:dist + 启动/守护/清理 node
+        └── dist/               #   构建产物（gitignore，make frontend 生成）
 
-internal/
-├── auth/
-│   ├── auth.go              # JWT 签发/校验 + sessions 表读写（存 sid 的 SHA-256）
-│   ├── github.go            # GitHub OAuth：authorize URL / code 换 token / 拉用户
-│   ├── middleware.go        # 鉴权中间件：解析会话 → 注入 context
-│   ├── cookie.go            # httpOnly 会话 Cookie 下发/清除/提取
-│   ├── origin.go            # CSRF 来源白名单校验
-│   ├── state.go             # OAuth state 一次性校验（DELETE ... RETURNING）
-│   ├── setup_token.go       # 首次引导令牌：随机生成 + 恒定时间比较
-│   ├── setup_token_test.go
-│   ├── state_test.go        # state 单次消费 / 伪造 / 过期
-│   └── origin_test.go       # 来源校验 + Cookie 属性测试
-├── config/config.go         # TOML 配置加载 + 启动期校验（hub.toml）
-├── config/config_test.go    # 默认值/未知键/校验/脱敏 断言
-├── db/
-│   ├── db.go                # pgxpool 连接池 + go:embed 迁移执行器
-│   └── migrations/
-│       ├── 0001_init.sql    # 5 张业务表 + 索引
-│       ├── 0002_oauth_states.sql
-│       └── 0003_local_auth.sql  # password_hash / is_admin / 用户名唯一索引
-├── hub/
-│   ├── server.go            # 路由分发 + 中间件链 + 统一响应 + CORS + 前端挂载
-│   ├── store.go             # 读查询：search / listRepos / getRepo / readme
-│   ├── store_write.go       # 写事务：create / update / delete（整体替换语义）
-│   ├── handlers_read.go     # 读接口处理器
-│   ├── handlers_write.go    # 写接口处理器
-│   ├── handlers_auth.go     # 登录/回调/me/登出 + upsertUser + 回跳与 Cookie
-│   ├── handlers_password.go # 本地用户名 + 密码登录
-│   ├── handlers_setup.go    # 首次部署引导（页面 + 创建管理员）
-│   ├── redirect_test.go     # 开放重定向防护测试
-│   └── setup_test.go        # 引导页/令牌校验行为测试
-├── localauth/
-│   ├── localauth.go         # bcrypt 哈希、密码/用户名校验、首个管理员创建
-│   └── localauth_test.go
-├── web/                     # 前端内嵌与 SSR 子进程托管
-│   ├── web.go               # go:embed all:dist + 释放 bundle + 启动/守护/清理 node
-│   ├── embed_check_test.go  # 守住 all: 前缀（防止静态资源静默丢失）
-│   └── dist/                # 构建产物（gitignore；由 make frontend 生成）
-│       ├── ssr.mjs          #   esbuild 打包的 SSR 单文件
-│       └── public/          #   客户端静态资源（含 _nuxt/）
-└── seed/seed.go             # 种子数据定义
+frontend/
+├── app/
+│   ├── pages/                  # 15 个页面（含 7 个文档页）
+│   ├── components/             # 10 个组件（含 DocsLayout）
+│   ├── composables/            # useApi / useAuth / useMarkdown
+│   ├── middleware/auth.ts      # 登录守卫（仅客户端）
+│   └── layouts/default.vue
+├── scripts/
+│   ├── build-ssr-bundle.mjs    # esbuild 打包成单个 ssr.mjs
+│   └── plugins/                # jsdom 兼容补丁
+└── nuxt.config.ts
+
+Makefile                        # 固化「先前端后后端」的构建顺序
+.github/workflows/build.yml     # CI：测试 + 构建 linux/amd64 + 发布
 ```
-
-### 前端 `frontend/`
-
-```
-app/
-├── app.vue                  # 根组件（NuxtLayout + NuxtPage）+ 全局 meta
-├── layouts/default.vue      # Header + main + Footer，min-h-[100dvh] + overflow-x-hidden
-├── middleware/auth.ts       # 登录守卫（仅客户端判定）
-├── components/
-│   ├── SiteHeader.vue       # 导航 + 手机 Drawer + 登录态用户菜单
-│   ├── SiteFooter.vue       # 页脚（safe-area 内边距）
-│   ├── RepoCard.vue         # 镜像卡片
-│   ├── SourceList.vue       # 详情页多源下载列表
-│   ├── SourceEditor.vue     # 下载源增删改（顺序即优先级）
-│   ├── RepoForm.vue         # 建仓/改仓共用表单
-│   ├── CopyButton.vue       # 复制按钮（含降级方案）
-│   ├── EmptyState.vue       # 空状态
-│   └── CardSkeleton.vue     # 加载骨架
-├── composables/
-│   ├── useApi.ts            # 读接口：useFetch + 统一解包 {code,message,data}
-│   ├── useAuth.ts           # 登录态 + login/logout + apiWrite
-│   └── useMarkdown.ts       # markdown-it(html:false) + DOMPurify
-├── pages/
-│   ├── index.vue            # 首页
-│   ├── explore/index.vue    # 浏览 + 搜索/排序
-│   ├── explore/[ns]/[repo].vue  # 详情
-│   ├── search.vue           # 搜索
-│   ├── login.vue            # 登录
-│   ├── submit.vue           # 提交镜像
-│   ├── dashboard.vue        # 用户中心
-│   ├── docs/                # 文档站（7 个页面）
-│   │   ├── index.vue        #   文档首页
-│   │   ├── quickstart.vue   #   快速开始
-│   │   ├── install.vue      #   安装与自检
-│   │   ├── pull-run.vue     #   拉取与运行
-│   │   ├── format.vue       #   镜像格式与下载源
-│   │   ├── submit.vue       #   提交镜像到 Hub
-│   │   └── faq.vue          #   常见问题
-│   └── about.vue            # 关于
-├── types/api.ts             # 后端响应类型（AuthUser/RepoInput 等）
-└── utils/
-    ├── format.ts            # 字节/数量/相对时间格式化 + 源类型元数据 + copyText
-    └── docs.ts              # 文档内容、导航与标题锚点渲染
-```
-
-**文档站布局**：`components/DocsLayout.vue`（桌面 sticky 侧边导航 /
-手机折叠目录 / 本页小节锚点 / 上下页翻页）。
 
 ---
 
 ## 三、数据模型
 
-```
-users (1) ──< repositories (1) ──< tags (1) ──< sources
-  │
-  └──< sessions
+**7 张表**，Hub 只存元数据：
 
-oauth_states（独立，OAuth CSRF 用，无外键）
-```
+| 表 | 说明 |
+|---|---|
+| `users` | 用户。`password_hash`（本地密码，可为 NULL）与 `github_id`（OAuth）互不冲突 |
+| `repositories` | 镜像元数据，`(namespace, name)` 唯一 |
+| `tags` | 单个仓库按 `tag + os + arch` 区分 |
+| `sources` | 每个 tag 的多个下载源（`type`/`url`/`priority`/`region`） |
+| `sessions` | 会话，存 `sid` 的 **SHA-256**（不存明文，可吊销） |
+| `oauth_states` | OAuth 一次性 state（10 分钟 TTL） |
+| `schema_migrations` | 迁移记录 |
 
-| 表 | 关键约束 | 说明 |
-|---|---|---|
-| `users` | `username` UNIQUE、`email` UNIQUE、`github_id` UNIQUE | 唯一约束是 L7 账号接管防护的基础 |
-| `repositories` | `UNIQUE(namespace, name)`、`owner_id` → users | 镜像仓库 |
-| `tags` | `UNIQUE(repo_id, tag, os, arch)` | 同一仓库按 tag+os+arch 区分 |
-| `sources` | `tag_id` → tags `ON DELETE CASCADE` | 每标签多个下载源 |
-| `sessions` | `id` UUID PK、`user_id` CASCADE、`token_hash` | 会话；登出即删行 |
-| `oauth_states` | `state` PK、`expires_at` | 一次性 state，10 分钟 TTL |
+迁移在启动时**自动执行**（`db.Migrate()`），按文件名排序、记录在 `schema_migrations`、
+可重复启动（幂等）。新增迁移就加一个 `0004_xxx.sql`。
 
-迁移由 `internal/db/db.go` 的 `go:embed` 执行器在**后端启动时自动运行**，
-记录在 `schema_migrations` 表，**可重复执行**。
-
-- `tags` 与 `sources` 均随 `repositories` 级联删除（`ON DELETE CASCADE`）
-- `sources` 随 `tags` 级联删除
+`0003_local_auth.sql` 的改动对老数据完全兼容：既有 OAuth 用户
+`password_hash` 为 NULL，登录行为不变。
 
 ---
 
@@ -238,375 +157,293 @@ oauth_states（独立，OAuth CSRF 用，无外键）
 handler := withLogging(s.withCORS(auth.OriginGuard(s.cfg.AllowedOrigins())(mux)))
 ```
 
-执行顺序（由外到内）：
-
-| 顺序 | 中间件 | 职责 |
+| 顺序 | 中间件 | 作用 |
 |---|---|---|
-| 1 | `withLogging` | 记录 `METHOD /path` |
-| 2 | `s.withCORS` | 白名单内的 Origin 才回显 CORS 头 + `Allow-Credentials` |
-| 3 | `auth.OriginGuard` | **写方法**的 Origin/Referer 同源校验（CSRF） |
-| 4 | `mux` | 路由；写接口再叠 `auth.Middleware`（会话鉴权） |
+| 1 | `withLogging` | 记录 `method path` |
+| 2 | `withCORS` | 处理跨源头 |
+| 3 | `OriginGuard` | 写请求校验 `Origin` 白名单（CSRF 防线） |
+| 4 | `mux` | 路由分发 |
 
-> `OriginGuard` 放在路由**之前**，确保覆盖所有写方法（含未来新增的写接口），
-> 不需要每个 handler 单独记得加。
+> **`OriginGuard` 在白名单为空时放行**（本地/CLI 调试方便）。
+> 生产由 `[site] frontend_url` 提供白名单，因此不会空。
 
 ### 4.2 统一响应格式
 
-```go
-type response struct {
-    Code    int         `json:"code"`     // 0 = 成功；失败时为 HTTP 状态码
-    Message string      `json:"message"`  // "ok" 或错误描述
-    Data    interface{} `json:"data"`
-}
+```json
+{ "code": 0, "message": "ok", "data": { } }
 ```
 
-- 成功：`writeOK(w, data)` → `{code:0, message:"ok", data:…}`
-- 失败：`writeErr(w, status, msg)` → `{code:<status>, message:…, data:null}`
-- 请求体解析：`decodeJSON` 限制 **1 MiB** 并 `DisallowUnknownFields()`
+`code = 0` 表示成功；非 0 时 HTTP 状态码与 `code` 一致。
 
-### 4.3 读接口
+### 4.3 路由分发
 
-`store.go` 中，`getRepo` 用 `json_agg` 一次查出仓库 + 所有 tags + 每个 tag 的 sources
-（sources 按 `priority` 排序），避免 N+1 查询。
+Go 1.22+ 的 `ServeMux` 按**模式具体程度**优先匹配，所以 `/api/v1/*` 不会被 `/` 吞掉：
 
-### 4.4 写接口（事务 + 整体替换）
+```go
+mux.HandleFunc("/api/v1/health", ...)   // 具体路径优先
+mux.Handle("/_nuxt/", fileServer)       // 静态资源
+mux.HandleFunc("/", ssrOrFallback)      // 兜底 → SSR
+```
 
-`createRepo` / `updateRepo` 均在**单个事务**内完成：
+### 4.4 写接口：整体替换语义
 
-1. 校验 payload（`RepoInput.validate()`）
-2. 写入/定位 repository
-3. `insertTagsAndSources` 写入全部 tags 与 sources
-4. 提交；失败则 `defer tx.Rollback`
+`PUT /api/v1/repos/{ns}/{repo}` 对 **tags 和 sources 是整体替换**，在单个事务内完成
+（删旧 + 插新）。
 
-**权限**：`updateRepo` / `deleteRepo` 先查 `owner_id`，非 owner 返回 `ErrForbidden` → 403。
-
-> **⚠️ `PUT` 是 tags/sources 整体替换语义**：请求体中未包含的标签与源会被**删除**。
-> 前端 `/dashboard` 编辑时因此先拉全量详情再预填（见 [6.4](#64-dashboard-编辑必须整体回填)）。
+> ⚠️ **前端编辑时必须先拉全量详情回填**，否则未提交的 tag/source 会被**静默删除**。
 
 ---
 
 ## 五、认证与会话
 
-### 5.1 会话存储：JWT + sessions 表双写
+### 5.1 两种登录方式并存
 
-`internal/auth/auth.go`：
-
-- `Issue()`：生成随机 `sid`（16 字节 hex）→ 写入 `sessions`（存 **sid 的 SHA-256**，不存原文）
-  → 签发 HS256 JWT（claims 含 `uid` 与 `sid`）
-- `Verify()`：验签名 + 查 `sessions` 表确认 `sid` 未过期未吊销 + 比对哈希 + 载入用户
-- `Revoke()`：删除 session 行，旧 token 立即失效
-
-即 **JWT 无状态签名 + 服务端可吊销会话** 的组合：既能水平扩展，又能即时登出。
-
-### 5.2 会话交付：httpOnly Cookie
-
-回调不返回裸 JSON，改为 **302 回前端**，会话以 Cookie 下发。
-
-```go
-// internal/auth/cookie.go
-const SessionCookieName = "boxli_session"
-
-http.SetCookie(w, &http.Cookie{
-    Name:     SessionCookieName,
-    Value:    token,
-    Path:     "/",
-    HttpOnly: true,                  // JS 读不到 → XSS 无法窃取
-    Secure:   opts.Secure,           // 生产 HTTPS 必须 true
-    SameSite: http.SameSiteLaxMode,  // 跨站 POST 不带 Cookie
-    MaxAge:   opts.MaxAge,
-})
-```
-
-**为什么不用 localStorage**：XSS 可直接读走会话。
-**为什么不把 token 放重定向 URL**：会进入浏览器历史、`Referer` 头与服务器访问日志。
-
-**token 提取顺序**（`SessionTokenFrom`）：Cookie 优先 → 回退 `Authorization: Bearer`。
-两条路径都支持，浏览器走 Cookie，**curl / CLI / 测试脚本走 Bearer**，无需处理 Cookie。
-
-> **⚠️ `SameSite` 为什么用 `Lax` 而非 `Strict`**：`Strict` 会导致「从 GitHub 跳回本站」
-> 这一顶层导航**不携带 Cookie**，表现为登录后仍未登录。
-
-### 5.3 OAuth 流程全链路
-
-```
-① 前端 POST /auth/login {redirect:"/submit"}
-   └─ 后端生成随机 state（32 字节）写入 oauth_states，同时记下 redirect
-   └─ 返回 authorize_url（含 state）
-② 浏览器整页跳转 → GitHub 授权页
-③ 用户点「授权」
-④ GitHub 回调 GET /auth/callback?code=…&state=…（回调到 127.0.0.1:3727，App 登记值）
-   └─ ① 校验并消费 state（DELETE ... RETURNING，原子）
-   └─ ② 检查 error 参数（用户取消）
-   └─ ③ code 换 access token
-   └─ ④ 拉取 GitHub 用户信息
-   └─ ⑤ upsert 用户（冲突 → 409 语义）
-   └─ ⑥ 签发会话 → Set-Cookie
-   └─ ⑦ 302 到 [site] frontend_url + redirect（站内路径）
-⑤ 前端页面 → GET /auth/me（自动带 Cookie）→ 显示已登录
-```
-
-**state 校验必须最先执行且总是消费**：无论后续成功、被用户拒绝还是出错，
-state 都已作废，不留可重放的凭证。实现用 `DELETE ... RETURNING` 保证
-「校验+删除」原子性，并发重放只有一个能成功。
-
-### 5.4 错误码（302 到 `/login?error=<code>`）
-
-| code | 触发条件 |
-|---|---|
-| `invalid_state` | state 缺失 / 伪造 / 已使用 / 过期 |
-| `state_error` | state 校验时数据库错误（500 级，但为 UX 仍回跳） |
-| `access_denied` | 用户在 GitHub 取消授权 |
-| `missing_code` | GitHub 未返回 code |
-| `exchange_failed` | 换 access token 失败（502 级） |
-| `github_failed` | 拉取 GitHub 用户失败 |
-| `identity_taken` | username/email 被另一 `github_id` 占用（L7） |
-| `user_failed` | 创建/更新用户失败 |
-| `issue_failed` | 签发会话失败 |
-
-前端 `login.vue` 把每个 code 映射为中文可读提示。
-
-### 5.5 CSRF 防护（Cookie 方案的必要配套）
-
-改用 Cookie 后，浏览器会自动携带凭证，「跨站发起的写请求」因此自带认证 —— 这正是 CSRF。
-
-| 层 | 机制 | 说明 |
+| 方式 | 凭据 | 适用 |
 |---|---|---|
-| 浏览器层 | Cookie `SameSite=Lax` | 跨站 POST 不携带 Cookie |
-| 应用层 | `OriginGuard` | 校验 `Origin`（缺失则回退 `Referer`）必须与白名单**精确同源** |
+| GitHub OAuth | `github_id` | 普通用户 |
+| 本地密码 | `password_hash`（bcrypt） | 首次引导创建的管理员；不想用 GitHub 的部署 |
 
-判定规则：
+共用 `users` 表。`password_hash` 为 NULL 的账号不能用密码登录，反之亦然。
 
-- 只作用于**非安全方法**（`POST`/`PUT`/`DELETE`/`PATCH`）；`GET`/`HEAD`/`OPTIONS` 放行
-  （`OPTIONS` 是 CORS 预检，拦掉会让正常请求也失败）
-- `Origin` 与 `Referer` **都没有** → 放行（curl/CLI 不携带 ambient 凭证，不构成 CSRF）
-- `Origin: null` → **拒绝**（沙箱 iframe、`file://` 等不可信场景）
+### 5.2 会话存储：JWT + sessions 表双写
 
-> **⚠️ 必须用 URL 解析而非前缀匹配**：`strings.HasPrefix(origin, "http://localhost:3011")`
-> 会把 `http://localhost:3011.evil.com` 判为可信。实现用 `url.Parse` 比较 scheme+host+port。
+- JWT（HS256）承载 `uid` / `sid` / 过期时间，**无状态校验签名**
+- `sessions` 表存 `sid` 的 **SHA-256**，**有状态校验是否被吊销**
 
-### 5.6 开放重定向防护
+两者都要通过。这样既有 JWT 的效率，又能真正登出（删表行即失效）。
 
-登录回跳地址由前端查询参数传入，属于不可信输入：
+### 5.3 会话交付：httpOnly Cookie
 
-```go
-func safeRedirectPath(p string) string {
-    if p == "" { return "" }
-    if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") { return "" }  // 拒绝协议相对
-    if strings.ContainsAny(p, "\\\r\n") { return "" }                          // 拒绝 CRLF 注入
-    if u, err := url.Parse(p); err != nil || u.IsAbs() || u.Host != "" { return "" }
-    return p
-}
+| 属性 | 值 | 原因 |
+|---|---|---|
+| `HttpOnly` | 是 | 防 XSS 读取 |
+| `SameSite` | `Lax` | 防 CSRF（配合 OriginGuard） |
+| `Secure` | 由 `cookie_secure` 决定 | HTTPS 下必须 true；http 下必须 false，否则浏览器直接丢弃 |
+
+`SessionTokenFrom` **优先读 Cookie，其次读 `Authorization: Bearer`** —— 后者供 CLI/curl 调试。
+
+### 5.4 CSRF 防护
+
+Cookie 方案的必要配套，两层：
+
+1. `SameSite=Lax` —— 跨站写请求不携带 Cookie
+2. `OriginGuard` —— 校验 `Origin` 与白名单**精确相等**（scheme + host + port，用
+   `url.Parse` 解析后比对，防 `evil.com` 伪造成 `boxli.dev.evil.com`）
+
+> CLI/curl 不带 `Origin` 时放行（不是浏览器发起的请求，不存在 CSRF 前提）。
+
+### 5.5 开放重定向防护
+
+OAuth 回跳落点经 `safeRedirectPath` 校验：只允许站内相对路径，
+`//evil.com`、`http://evil.com` 一律拒绝，回落到 `/dashboard`。
+
+### 5.6 OAuth 流程
+
+```
+/login 点登录 → POST /auth/login 返回 authorize_url
+   → 跳 GitHub 授权 → 回 /api/v1/auth/callback?code=&state=
+   → 校验并**原子消费** state（DELETE ... RETURNING，防重放）
+   → code 换 token → 拉用户 → upsertUser → 下发 Cookie → 302 回前端
 ```
 
-放行 `/submit`、`/explore/a/b`、`/submit?x=1`；拒绝 `https://evil.com`、`//evil.com`、
-`javascript:…`、`/path\r\nLocation:…`。不合法时回退 `/dashboard`。
+失败一律 302 到 `/login?error=<code>`，不把内部错误暴露给用户。
 
-### 5.7 CORS 与 Cookie 的兼容性（易漏点）
-
-`Access-Control-Allow-Origin: *` 与带凭证的请求**天然不兼容**，浏览器会直接拒绝。
-因此在改用 Cookie 的同时必须修改 CORS：
-
-```go
-if origin != "" && auth.OriginAllowed(origin, allowed) {
-    w.Header().Set("Access-Control-Allow-Origin", origin)   // 回显具体 Origin，不能用 *
-    w.Header().Set("Access-Control-Allow-Credentials", "true")
-    w.Header().Add("Vary", "Origin")                        // 防中间缓存串站
-}
-```
-
-> 开发期前端经 Nuxt 同源代理，**根本不产生跨源请求**；
-> 生产由 Nginx 同源反代后同样不产生。此改动主要为兼容直连后端的场景，并推进 L5。
-
-### 5.8 dev 模拟登录（默认关闭）
-
-`[dev] enabled = true` 且未配 OAuth 凭证时，`POST /auth/login {"github_user":"x"}` 直接下发会话。
-**默认关闭**——开启后任何人可登录为任意账号。
-
-> 注意：dev 登录每次生成**随机 `github_id`**，若用户名已存在会触发 L7 的 409 防护。
-> 这是**正确行为**，测试时换个未占用的用户名即可。
-
-### 5.9 `upsertUser` 与 L7
+### 5.7 `upsertUser` 的账号接管防护
 
 ```sql
-INSERT INTO users (username, email, avatar_url, github_id)
-VALUES ($1, NULLIF($2,''), NULLIF($3,''), $4)
-ON CONFLICT (github_id) DO UPDATE SET username = EXCLUDED.username, …
-RETURNING id, username
+INSERT INTO users (username, email, avatar_url, github_id) VALUES (...)
+ON CONFLICT (github_id) DO UPDATE SET ...
 ```
 
-唯一冲突（username/email 被**另一个** `github_id` 占用）时返回 `errIdentityTaken` → 409。
+username/email 被**另一个** `github_id` 占用时返回 409。
 
-> **⚠️ 绝不能在冲突时「按 username 退化查找并登录」** —— 那会让新 GitHub 账号
-> 接管同名老账号（账号接管漏洞）。这是已修复的 L7。
+> ⚠️ **绝不能**在冲突时「按 username 退化查找并登录」—— 那会让新 GitHub 账号
+> 接管同名老账号。这是已修复的账号接管漏洞。
 
-### 5.10 本地密码认证（`internal/localauth`）
-
-与 GitHub OAuth **并存**，共用 `users` 表：`password_hash` 为 NULL 的账号只能走 OAuth，
-反之亦然。
+### 5.8 本地密码（`internal/localauth`）
 
 | 关注点 | 做法 |
 |---|---|
-| 存储 | `bcrypt`（`golang.org/x/crypto`），加盐哈希，不可逆 |
-| 用户枚举防护 | 「用户不存在」与「密码错误」返回**同一错误**，且账号不存在时**仍执行一次 bcrypt 比较**，拉平响应耗时 |
-| 用户名规则 | 3–32 字符，仅 ASCII 字母/数字/`_`/`-`（避免 URL 路径与日志歧义）|
-| 密码规则 | ≥8 字符、≤72 **字节**（bcrypt 只取前 72 字节，超出会静默截断）、拒绝常见弱口令 |
-| 密码比对 | `bcrypt.CompareHashAndPassword`（内部为恒定时间比较）|
+| 存储 | bcrypt 加盐哈希 |
+| 用户枚举防护 | 「用户不存在」与「密码错误」返回**同一错误**，且账号不存在时**仍执行一次 bcrypt 比较**拉平耗时 |
+| 用户名 | 3–32 字符，仅 ASCII 字母/数字/`_`/`-`（避免 URL 路径与日志歧义） |
+| 密码 | ≥8 字符、≤**72 字节**、拒绝常见弱口令 |
 
-> **为什么限制 72 字节**：bcrypt 静默忽略第 72 字节之后的内容。若不限制，
+> **为什么限制 72 字节**：bcrypt 静默忽略第 72 字节之后的内容。不限制的话，
 > 用户会以为超长密码更安全，实际强度等同截断后的前缀。
 
-### 5.11 首次部署引导（`/setup`）
+### 5.9 首次部署引导（`/setup`）
 
-当 `users` 表为空时，启动流程生成一次性令牌并打印到**服务端日志**：
+启动时若 `users` 表为空，生成一次性令牌并打印到**服务端日志**：
 
 ```go
-setupToken, _ := auth.NewSetupToken()           // 32 字节随机 → 64 位十六进制
-userCount, _ := localauth.NewStore(pool).UserCount(ctx)
-if userCount == 0 {
+setupToken, _ := auth.NewSetupToken()        // 32 字节随机 → 64 位十六进制
+if n, _ := localauth.NewStore(pool).UserCount(ctx); n == 0 {
     srv.EnableSetup(setupToken)
     log.Printf("请在浏览器打开： http://<域名>/setup?token=%s", setupToken)
 }
 ```
 
-**三重防护**（对应 `handlers_setup.go`）：
+**三重防护**：
 
-| 防护 | 实现 | 防的是什么 |
-|---|---|---|
-| 一次性令牌 | `auth.ConstantTimeEqual(token, got)` | 公网用户抢先注册管理员 |
-| 仅无用户时可用 | `CreateFirstAdmin` 在同一事务内 `SELECT COUNT(*)` 后再插入 | 并发请求创建出多个管理员；初始化后被重放 |
-| 恒定时间比较 | `subtle.ConstantTimeCompare` | 逐字节推断令牌的时序侧信道 |
+| 防护 | 防的是什么 |
+|---|---|
+| 令牌只出现在服务端日志 | 公网访问者看不到日志，无法抢先注册管理员 |
+| 计数 + 插入在**同一事务** | 并发请求创建出多个管理员；初始化后被重放 |
+| `subtle.ConstantTimeCompare` | 时序侧信道推断令牌 |
 
-设计取舍：
+**引导页是内嵌的自包含 HTML，不走 Nuxt。** 因为引导发生时 `frontend_url` 可能还是
+默认值 —— 依赖 SPA 会让「首次部署」这个最需要可靠的环节变脆弱。
 
-- **引导页是内嵌的自包含 HTML**，不走 Nuxt。因为引导发生时前端可能尚未正确配置
-  （`frontend_url` 可能还是默认值），依赖 SPA 会让「首次部署」这一最需要可靠的环节变脆弱。
-- **令牌只出现在日志里**，不写入数据库也不返回给前端 —— 能看到日志即证明对该服务器有控制权。
-- 初始化成功后**立即调用 `invalidateSetupToken()`**，并因 `users` 非空而永久关闭接口。
+初始化成功后立即 `invalidateSetupToken()`，并因 `users` 非空而永久关闭。
+
+### 5.10 dev 模拟登录
+
+`[dev] enabled = true` 时，`POST /auth/login` 传 `{"github_user":"x"}` 即可登录为任意账号。
+
+> **置为 true 时程序直接拒绝启动**，避免误带入生产。仅用于本地调试。
 
 ---
 
 ## 六、前端实现
 
-### 6.1 读接口封装（`useApi.ts`）
+### 6.1 数据获取（`useApi.ts`）
 
 `useFetch` + `transform` 统一解包 `{code,message,data}`，页面直接消费 `data`。
-`useSearch` 在关键词为空时不发请求（`immediate: hasQuery`）。
 
-### 6.2 登录态管理（`useAuth.ts`）
+**四页在服务端取数**（SEO 关键）：`index.vue`、`explore/index.vue`、
+`explore/[ns]/[repo].vue`、`search.vue`。
 
-```ts
-const user = useState<AuthUser | null>('auth-user', () => null)
-const resolved = useState<boolean>('auth-resolved', () => false)
-```
+### 6.2 登录态（`useAuth.ts`）
 
-- **不保存 token**：会话在 httpOnly Cookie 里，JS 读不到（这正是选该方案的目的）。
-  前端只保存「当前用户是谁」这一衍生状态，真相来源是 `GET /auth/me`。
-- `refresh()`：调 `/auth/me`，`ignoreResponseError: true` —— 401 是「未登录」的正常表达，
-  不该抛错中断流程。
-- `ensure()`：已确认过则复用，避免重复请求与 UI 闪烁。
-- `apiWrite()`：所有写请求统一加 `credentials: 'include'`，
-  否则浏览器不附带 Cookie，会被后端 401。
+`ensure()` 有缓存，避免每个页面重复请求 `/auth/me`。`apiWrite()` 统一封装写请求
+（自动带 Cookie、处理 CSRF 与 401）。
 
 ### 6.3 登录守卫（`middleware/auth.ts`）
 
 ```ts
-export default defineNuxtRouteMiddleware(async (to) => {
-  if (import.meta.server) return          // ← 关键
-  const { ensure } = useAuth()
-  if (await ensure()) return
-  return navigateTo({ path: '/login', query: { redirect: to.fullPath } })
-})
+if (import.meta.server) return   // ← 关键
 ```
 
-> **⚠️ 为什么首行必须 `if (import.meta.server) return`**：
-> 会话在 httpOnly Cookie 中，**SSR 期间不会自动携带**（服务端内部请求不带浏览器 Cookie）。
-> 若在 SSR 就判定并跳转，会把**已登录用户也误判为未登录**，且产生 hydration 不一致。
+**会话在 httpOnly Cookie 里，SSR 阶段拿不到**（服务端内部请求不会自动携带 Cookie）。
+若在 SSR 就跳转，会把已登录用户也误判为未登录。因此登录态**只能在客户端判定**。
 
-### 6.4 `/dashboard` 编辑必须整体回填
+### 6.4 手机优先要点
 
-后端 `PUT` 是 tags/sources **整体替换**语义，而列表接口 `GET /repos` 返回的
-`RepoSummary` **不含 tags**。因此 `startEdit()` 会先单独拉一次
-`GET /repos/{ns}/{repo}` 拿全量数据，再交给 `RepoForm` 预填。
+- 交互元素 `min-h-11`（44px）且带 `min-w-11`
+- 输入框 `text-base`（16px），避免 iOS 聚焦缩放
+- 全局 `min-h-[100dvh]`（不用 `100vh`）与 `overflow-x-hidden`
+- 页脚 `pb-[calc(2rem+env(safe-area-inset-bottom))]` 防 iPhone 横条遮挡
+- **不依赖 hover**（手机没有 hover）；汉堡菜单用 fuxsto `Drawer`
+- 长 URL `break-all`，标签栏 `overflow-x-auto`
 
-> 若直接用列表项预填并提交，未在表单中出现的标签与源会被**静默删除**。
+### 6.5 README 渲染安全
 
-### 6.5 `SourceEditor` 的单向数据流
-
-初版实现直接修改传入的 `sources` prop 数组（依赖「数组按引用传递」这一脆弱假设），
-被 `eslint` 的 `vue/no-mutating-props` 抓出。现改为：
-
-```ts
-const emit = defineEmits<{ (e: 'change', sources: SourceRow[]): void }>()
-function commit(next: SourceRow[]) {
-  // 复制为新数组并重排 priority，保证「展示顺序 == 优先级」
-  emit('change', next.map((s, i) => ({ ...s, priority: i + 1 })))
-}
-```
-
-**优先级由顺序决定**，用户无需手填 `priority`，避免顺序与优先级不一致。
-
-### 6.6 手机优先实现要点
-
-| 规范 | 实现 |
-|---|---|
-| 点击区 ≥44px | 统一 `min-h-11` / `min-h-12`；图标按钮补 `min-w-11` |
-| 输入框 ≥16px | 所有 `input/textarea/select` 用 `text-base`（防 iOS 聚焦缩放） |
-| 不用 `100vh` | 布局用 `min-h-[100dvh]` |
-| 无横向滚动 | 布局 `overflow-x-hidden`；输入框 `w-full min-w-0`；长文本 `truncate`/`line-clamp` |
-| 不依赖 hover | 菜单、操作按钮全部可点，无 `group-hover` 显隐 |
-| safe-area | 页脚 `pb-[calc(2rem+env(safe-area-inset-bottom))]` |
-
-### 6.7 SSR / hydration 注意点
-
-- 相对时间（`formatRelativeTime`）传入固定基准 `now`，避免服务端与客户端时间差导致
-  hydration 不一致
-- 页脚年份用 `useState` 固定
-- 登录态相关的 DOM 差异**一律在客户端渲染后出现**（SSR 阶段统一按未登录渲染）
-
-### 6.8 文档站
-
-文档站不引入任何新依赖，复用既有渲染链路与组件风格：
-
-| 文件 | 职责 |
-|---|---|
-| `utils/docs.ts` | 文档内容（Markdown 常量）+ `DOC_PAGES` 结构 + `docNav` / `docNeighbors` / `renderDocMarkdown` |
-| `components/DocsLayout.vue` | 文档布局：侧边导航、手机折叠目录、本页锚点、上下页翻页、正文排版 |
-| `pages/docs/*.vue` | 7 个页面，每个仅一行 `<DocsLayout path="…" />`，标题与描述由数据驱动 |
-
-**内容与导航同源**：页面标题、`<title>`、描述、侧边导航标签、上下页全部从
-`DOC_PAGES` 派生，避免多处维护产生不一致。`pages/docs/*.vue` 因此只是薄壳，
-不重复声明 `useHead`。
-
-**标题锚点深链**：`useMarkdown.ts` 新增 `slugify` 与 `heading_open` 渲染规则，
-为 `##`/`###` 标题注入 `id`：
-
-- slug 规则：小写 → 去反引号与标点 → 空白转 `-`，**保留中日韩文字**
-  （如 `CLI 与 Hub 的对接现状` → `cli-与-hub-的对接现状`）
-- 同页重复标题自动加 `-1`、`-2` 后缀，避免 `id` 冲突
-- **通过 `anchors` 选项开关**：文档站开启，**镜像 README 保持关闭**（行为不变）
-- DOMPurify 的 `ADD_ATTR` 增加 `id`，否则清洗时会被剥掉导致锚点失效
-- 标题加 `scroll-margin-top: 5rem`，避免锚点跳转后被 sticky 头部遮挡
-
-> **⚠️ 踩坑记录**：首版未给标题注入 `id`，导致文档中手写的跨页深链
-> （如 `/docs/faq#cli-与-hub-的对接现状`）**全部是死链**。已用脚本逐条校验
-> 「目标页面存在 + 目标锚点存在」修复并回归。
-
-**手机端阅读体验**：
-
-- 侧边导航在 `lg` 以下收起为**点击展开**的折叠目录（不用 hover，规避坑 2）
-- 本页小节在手机端改为**横向滚动 chip 条**（`overflow-x-auto` + `w-max`）
-- 宽表格 `display: block` + `overflow-x-auto` 横向滚动；代码块 `pre` 同样可横向滚动，
-  避免撑破窄屏
-- 正文 `text-base`、行高 1.75；行内代码 15px 且 `word-break: break-all` 防长串溢出
-
-**内容准确性约束**：文档中的命令与 flag 照实抄录自真实 `boxli` 二进制
-（`boxli version 0.0.0-dev`），不臆造。实测发现 CLI 对接的是**另一套 Hub**
-（`boxli hub serve`），与本站 `/api/v1/*` 并非同一实现，已在 `/docs/faq` 首节
-如实标注可用范围，且**不提供**无法执行的示例。
+`markdown-it`（**`html: false`**，禁用原始 HTML）+ `isomorphic-dompurify` 清洗后输出。
+外链自动补 `target="_blank" rel="noopener noreferrer nofollow"`。
 
 ---
 
-## 七、API 参考
+## 七、前端内嵌与 SSR 托管
+
+这是「单二进制部署」的实现所在。
+
+### 构建管线
+
+```
+frontend/app/**                      源码
+      │ npm run build                （Nuxt）
+      ▼
+frontend/.output/
+      ├── public/                    客户端资源（_nuxt/*.js|css）
+      └── server/                    Nitro SSR + node_modules（约 19MB）
+                │ npm run build:ssr-bundle   （esbuild --bundle）
+                ▼
+backend/internal/web/dist/
+      ├── public/                    直接拷贝
+      └── ssr.mjs                    单文件 15.2MB（gzip 2.0MB，已内联全部依赖）
+                │ go:embed all:dist
+                ▼
+backend/boxli-hub                    33MB 单二进制
+```
+
+打包后不再需要 `node_modules`，因此可以整体 embed。
+
+### 必须用 `go:embed all:`
+
+Go 的 `go:embed` **默认忽略**以 `.` 或 `_` 开头的目录，而 Nuxt 的资源目录正是 **`_nuxt/`**：
+
+```go
+//go:embed all:dist      // ✅ 包含 _nuxt/
+//go:embed dist          // ❌ 静态资源全部丢失
+```
+
+`embed_check_test.go` 专门守住这点：断言嵌入文件数非零且存在 `_nuxt`。
+
+> 若 `dist/` **整体缺失**，`go build` 会报 `pattern all:dist: no matching files found`。
+> 这是有意保留的失败方式 —— 比静默产出前端不可用的二进制要好。
+
+### SSR 子进程生命周期
+
+`web.StartSSR()`：
+
+1. 读取内嵌的 `ssr.mjs`
+2. `os.MkdirTemp`（0600）写入
+3. `net.Listen("tcp","127.0.0.1:0")` 取一个空闲端口后关闭，交给 node
+4. 启动 node，注入 `NITRO_PORT` / `NITRO_HOST=127.0.0.1` / `NODE_ENV=production`
+5. 轮询端口直到可连接（最多 30 秒）
+
+**`SysProcAttr` 的两个关键设置**：
+
+| 设置 | 作用 |
+|---|---|
+| `Setpgid: true` | 独立进程组，退出时 `kill(-pid, SIGTERM)` 连带清理 node 派生的子进程 |
+| `Pdeathsig: SIGTERM` | **内核级兜底**：主进程被 `SIGKILL` 或崩溃时，node 自动终止 |
+
+> **`Pdeathsig` 是实测补上的**：只靠 `defer ssr.Stop()` 时，主进程被 `SIGKILL`
+> 会来不及执行 defer，node 变成 `PPID=1` 的孤儿并持续占用端口与内存。
+> 加 `Pdeathsig` 后实测 `kill -9` 主进程，node 随之消失。
+
+`Stop()`：SIGTERM 整个进程组 → 等 5 秒 → SIGKILL → 删除临时目录。可安全重复调用。
+
+> ⚠️ **Nitro 读的是 `NITRO_PORT`/`NITRO_HOST`，不是 `PORT`/`HOST`。**
+> 用后者设置端口是无效的。
+
+### 静态资源挂载的坑
+
+```go
+// Assets() 返回的文件系统根对应 dist/public，其下**就包含 _nuxt/**
+mux.Handle(web.PublicPrefix, http.FileServer(http.FS(pub)))
+```
+
+**不能加 `http.StripPrefix`** —— URL 路径可直接映射到该 fs；加了会让它去找根下的
+`entry.css` 而 404。
+
+### 打包解决的三个 jsdom 兼容问题
+
+`isomorphic-dompurify` 在 Node 下 `import { JSDOM } from 'jsdom'`，而 jsdom 是
+CommonJS 且有运行时文件依赖。打成 ESM 后会连续出错：
+
+| 报错 | 原因 | 解法 |
+|---|---|---|
+| `Dynamic require of "node:fs" is not supported` | jsdom 用动态 require | 注入 `createRequire` 兼容层 |
+| `ReferenceError: __dirname is not defined` | esbuild 不提供 CJS 全局量 | banner 补 `__filename`/`__dirname` |
+| `ENOENT ... /default-stylesheet.css` | jsdom 用 `__dirname` 相对路径读文件 | 插件**内联为字符串常量** |
+| `Cannot find module './xhr-sync-worker.js'` | `require.resolve` 的文件未被打出 | 替换为占位（仅同步 XHR 用，DOMPurify 不用） |
+
+兼容层用**精确正则匹配源码**：jsdom 升级导致语句形式变化时会**直接报错**，而非静默失效。
+
+### 开发 vs 生产
+
+| | 开发 | 生产（单二进制） |
+|---|---|---|
+| 前端 | `nuxt dev`（热更新） | 内嵌 bundle，主进程托管 |
+| API | Nuxt `routeRules` 代理 → 3727 | Go 原生处理 |
+| 端口 | 3011 | 仅 3727 |
+
+---
+
+## 八、API 参考
 
 所有接口在 `/api/v1/` 下，响应统一 `{code, message, data}`。
 
@@ -615,482 +452,210 @@ function commit(next: SourceRow[]) {
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
-| GET | `/search?q=&limit=` | 搜索（`name`/`description`/`namespace` ILIKE） |
-| GET | `/repos?namespace=&limit=&offset=` | 仓库列表 |
-| GET | `/repos/{ns}/{repo}` | 详情（含所有 tags 与 sources） |
+| GET | `/search?q=&limit=` | 搜索 |
+| GET | `/repos?namespace=&limit=&offset=` | 列表 |
+| GET | `/repos/{ns}/{repo}` | 详情（含全部 tags 与 sources） |
 | GET | `/repos/{ns}/{repo}/tags` | 标签列表 |
 | GET | `/repos/{ns}/{repo}/readme` | README 文本 |
+
+> ⚠️ `/health` **恒返回 healthy**，不探测数据库。真正的探活用 `/repos?limit=1`。
 
 ### 认证
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/auth/login` | 有 OAuth 凭证返回 `authorize_url`；否则需 `[dev] enabled = true` 才模拟登录 |
-| GET | `/auth/callback?code=&state=` | 校验并消费 state → 换 token → **302 回前端** + Set-Cookie |
+| POST | `/auth/login` | 返回 `authorize_url` |
+| POST | `/auth/password` | 本地用户名 + 密码登录 |
+| GET | `/auth/callback?code=&state=` | 校验并消费 state → 302 回前端 |
 | GET | `/auth/me` | 当前用户（Cookie 或 Bearer） |
-| POST | `/auth/logout` | 吊销 session + 清 Cookie |
+| POST | `/auth/logout` | 吊销 session 并清 Cookie |
+
+### 首次部署引导
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/setup?token=` | 引导页面（自包含 HTML） |
+| POST | `/setup` | 创建首个管理员（需一次性令牌） |
 
 ### 写接口（需登录）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/repos` | 创建（`namespace` 缺省为当前用户名）→ 201 |
-| PUT | `/repos/{ns}/{repo}` | 更新（仅 owner；tags/sources **整体替换**） |
-| DELETE | `/repos/{ns}/{repo}` | 删除（仅 owner；级联删除 tags/sources） |
+| POST | `/repos` | 创建（`namespace` 缺省为当前用户名） |
+| PUT | `/repos/{ns}/{repo}` | 更新（仅 owner，**整体替换**） |
+| DELETE | `/repos/{ns}/{repo}` | 删除（仅 owner，级联） |
 
 ### 请求体示例
 
-```json
+```jsonc
+// POST /repos
 {
   "namespace": "alice",
-  "name": "myapp",
-  "description": "My awesome app",
-  "readme": "# myapp",
+  "name": "my-app",
+  "description": "示例镜像",
+  "readme": "# 标题\n正文",
   "tags": [
     {
       "tag": "v1.0.0", "os": "linux", "arch": "amd64",
       "sources": [
-        { "type": "github", "url": "https://github.com/…", "priority": 1, "region": "global" },
-        { "type": "gitee",  "url": "https://gitee.com/…",  "priority": 2, "region": "cn" }
+        { "type": "github", "url": "https://...", "priority": 1, "region": "cn" }
       ]
     }
   ]
 }
 ```
 
-**支持的源类型**：`github` `gitlab` `gitee` `http` `s3` `oss` `cos` `ipfs` `magnet` `direct`
-
-**校验规则**：`namespace`+`name` 必填、至少 1 个 tag、每 tag 至少 1 个 source、
-每 source 的 `type` 与 `url` 必填。
-
 ### 错误码
 
-| HTTP | 场景 |
+| 码 | 含义 |
 |---|---|
-| 400 | 请求体非法 / 缺必填字段 / 空 tags |
-| 401 | 无会话凭证或会话失效 |
-| 403 | 非 owner / **跨站来源被 CSRF 拦截** |
-| 404 | 仓库不存在 |
-| 409 | 仓库已存在 / 用户名被占用 |
-| 503 | 未配 `[session] jwt_secret`；或未配 OAuth 且未开 dev 登录 |
+| 400 | 参数错误 |
+| 401 | 未登录 / 凭据错误 |
+| 403 | CSRF 拒绝 / 无权限 / 引导令牌无效 |
+| 404 | 资源不存在 |
+| 409 | 冲突（用户名被占用、系统已初始化） |
+| 500 | 服务端错误 |
+| 503 | 未配 `jwt_secret`，或未配 OAuth 且未开 dev 登录 |
 
 ---
 
-## 七bis、前端内嵌与 SSR 子进程托管
+## 九、本地开发
 
-这是「单二进制部署」的实现所在，涉及 `internal/web` 与 `frontend/scripts`。
-
-### 构建管线
-
-```
-frontend/app/**                        源码
-      │  nuxt build
-      ▼
-frontend/.output/
-      ├── public/           客户端资源（_nuxt/*.js|css）
-      └── server/           Nitro SSR 服务 + node_modules（约 19MB）
-                │  esbuild --bundle
-                ▼
-backend/internal/web/dist/
-      ├── public/           直接拷贝，Go 用 http.FileServer 伺服
-      └── ssr.mjs           单文件（15.2MB / gzip 2.0MB，已内联全部依赖）
-                │  go:embed all:dist
-                ▼
-backend/boxli-hub（33MB 单二进制）
-```
-
-### 为什么必须用 `go:embed all:`
-
-Go 的 `go:embed` **默认忽略**以 `.` 或 `_` 开头的目录与文件，
-而 Nuxt 的静态资源目录恰好是 **`_nuxt/`**。
-
-```go
-//go:embed all:dist      // ✅ 正确：包含 _nuxt/
-//go:embed dist          // ❌ 静态资源全部丢失，且编译期不报错
-var assets embed.FS
-```
-
-`internal/web/embed_check_test.go` 专门守这一点：断言嵌入的文件数非零且存在 `_nuxt` 目录，
-防止有人把 `all:` 前缀改掉后只在运行时才发现 404。
-
-> 顺带说明：若 `dist/` **整体缺失**，`go build` 会报
-> `pattern all:dist: no matching files found` —— 这是有意保留的失败方式，
-> 比静默产出一个前端不可用的二进制要好。
-
-### SSR 子进程生命周期
-
-`web.StartSSR()` 的步骤：
-
-1. 读取内嵌的 `ssr.mjs`
-2. `os.MkdirTemp`（权限 0700）→ 写入 `ssr.mjs`
-3. `net.Listen("tcp","127.0.0.1:0")` 取一个空闲端口后立即关闭，把端口交给 node
-4. 启动 node 子进程，注入 `NITRO_PORT` / `NITRO_HOST=127.0.0.1` / `NODE_ENV=production`
-5. 轮询该端口直到可连接（最多 30 秒），就绪后返回反向代理
-
-**`SysProcAttr` 的两个关键设置**：
-
-| 设置 | 作用 |
-|---|---|
-| `Setpgid: true` | 独立进程组。退出时用 `kill(-pid, SIGTERM)` 连带清理 node 派生的子进程 |
-| `Pdeathsig: SIGTERM` | **内核级**兜底：主进程被 `SIGKILL` 或崩溃时，node 自动终止 |
-
-> **`Pdeathsig` 是实测补上的**：只靠 `defer ssr.Stop()` 时，若主进程被 `SIGKILL`
-> （来不及执行 defer），node 会变成 `PPID=1` 的孤儿并持续占用端口与内存。
-> 加 `Pdeathsig` 后实测：`kill -9` 主进程，node 子进程随之消失。
-
-`Stop()` 的清理顺序：SIGTERM 整个进程组 → 等 5 秒 → SIGKILL → 删除临时目录。
-可安全重复调用（有 `stopped` 标志）。
-
-### 路由挂载顺序
-
-`server.go` 的 `mountFrontend()` 把前端挂在**最后**：
-
-```go
-mux.HandleFunc("/api/v1/...", ...)      // 更具体的模式
-mux.Handle("/_nuxt/", fileServer)       // 静态资源
-mux.HandleFunc("/", ssrOrFallback)      // 兜底 → SSR
-```
-
-Go 1.22+ 的 `ServeMux` 按**模式具体程度**优先匹配，因此 `/api/v1/*` 不会被 `/` 吞掉。
-
-> **一个曾踩到的坑**：`/_nuxt/` 的 handler **不能**用 `http.StripPrefix`。
-> `web.Assets()` 返回的文件系统根对应 `dist/public`，其下**就包含 `_nuxt/`**，
-> 所以 URL 路径可直接映射；StripPrefix 会让它去找根下的 `entry.css` 而 404。
-
-### 打包时解决的三个 jsdom 兼容问题
-
-`isomorphic-dompurify` 在 Node 条件下 `import { JSDOM } from 'jsdom'`，
-而 jsdom 是 CommonJS 且有运行时文件依赖。esbuild 打成 ESM 后会连续出错：
-
-| 报错 | 原因 | 解法（`frontend/scripts/`） |
-|---|---|---|
-| `Dynamic require of "node:fs" is not supported` | jsdom 用动态 require | 注入 `createRequire` 兼容层（`--banner:js`） |
-| `ReferenceError: __dirname is not defined` | esbuild 不提供 CJS 全局量 | 同上的 banner 里补 `__filename`/`__dirname` |
-| `ENOENT ... /default-stylesheet.css` | jsdom 用 `__dirname` 相对路径读文件 | 插件把它**内联为字符串常量** |
-| `Cannot find module './xhr-sync-worker.js'` | `require.resolve` 的文件未被打出 | 插件替换为占位（仅同步 XHR 用，DOMPurify 不用 XHR） |
-
-> 这些兼容层集中放在 `frontend/scripts/plugins/jsdom-inline-stylesheet.mjs`，
-> 并用**精确正则匹配**源码：若 jsdom 升级导致语句形式变化，插件会**直接报错**
-> 而不是静默失效。
-
-### 开发模式 vs 生产模式
-
-| | 开发 | 生产（单二进制） |
-|---|---|---|
-| 前端进程 | `nuxt dev`（热更新） | 内嵌 bundle，由主进程托管 |
-| API 路径 | Nuxt `routeRules` 代理 → 3727 | Go 原生处理 |
-| 端口 | 3011（勿用 3000，见 README） | 仅 3727 |
-| `frontend_url` | `http://localhost:3011` | `https://boxli.dev` |
-
----
-
-## 八、本地开发与调试
-
-> **推荐用 Makefile**，因为它固化了「先前端后后端」的顺序：
->
-> ```bash
-> make build          # 前端打包 + 后端内嵌（生产形态）
-> make dev-backend    # 本地起后端
-> make dev-frontend   # 本地起前端（3011）
-> make test / vet / clean
-> make help           # 列出全部目标
-> ```
->
-> ⚠️ 直接 `cd backend && go build` 时，若 `internal/web/dist/` 尚未生成，
-> 编译会报 `pattern all:dist: no matching files found`。先 `make frontend`。
-
-### 8.1 后端
+### 9.1 常用命令
 
 ```bash
-cd backend
-export GOCACHE=/home/xgp2012/hub/.devtools/gocache \
-       GOMODCACHE=/home/xgp2012/hub/.devtools/gomodcache \
-       GOPATH=/home/xgp2012/hub/.devtools/gopath
-# 首次：复制 hub.toml.example 为 hub.toml 并按需修改
-cp hub.toml.example hub.toml
-go run ./cmd/hub     # 启动时自动迁移；监听 127.0.0.1:3727（可加 --config 指定文件）
-go run ./cmd/seed    # 种子数据（幂等）
+make build          # 前端打包 + 后端内嵌（生产形态）
+make dev-backend    # 起后端（读 backend/hub.toml）
+make dev-frontend   # 起前端（3011）
+make test / vet / fmt / clean
+make help           # 列出全部目标
 ```
 
-> 沙箱不允许写 `~/.cache` 与 `~/go`，故 Go 缓存必须指向工作区内。
+> **必须遵守「先前端后后端」的顺序**，`make build` 已经固化。
+> 直接 `cd backend && go build` 时若 `internal/web/dist/` 不存在会编译失败。
 
-> `go run ./cmd/hub` 会**同时启动 SSR 子进程**（因为内嵌前端始终存在）。
-> 若只想调后端 API，加 `--no-ssr` 跳过前端，可省下约 15MB 的内存与启动时间。
-
-### 8.2 前端
-
-> **⚠️ 本机不能用 3000 端口** —— 3000 属 **Forgejo**（`forgejo.service`，uid 115，开机自启），
-> 与 Boxli 前端无关。必须换端口（如 3011），并**同步修改 `hub.toml` 的 `[site] frontend_url`**，
-> 否则 OAuth 回跳落错站点、写请求被 CSRF 拦截（403）。见 [11.1](#111-本机端口约束务必遵守)。
+### 9.2 数据库
 
 ```bash
-cd frontend
-export npm_config_cache=/home/xgp2012/hub/.devtools/npmcache
-npm install
-PORT=3011 node node_modules/nuxt/bin/nuxt.mjs dev   # 注意：.bin/nuxt 可能缺可执行位
-node node_modules/nuxt/bin/nuxt.mjs build
-PORT=3011 node .output/server/index.mjs             # 生产预览（端口任选非 3000）
+createdb boxli_hub          # 或用 psql
+# 建表不需要单独执行：启动时自动迁移
 ```
 
-前端 dev 通过 `routeRules` 把 `/api/**` 代理到 `http://127.0.0.1:3727`，**无需 CORS**。
-
-> **如何判断某个端口归谁**（本机排查要点）：
-> `ss -ltnp` 对**其他用户**持有的 socket **不显示 PID**，容易被误读成「孤儿 socket」。
-> 应改用 `ss -ltnpe`，读取 `uid:` 与 `cgroup:` 字段来判定归属：
->
-> ```bash
-> ss -ltnpe | grep -E ':(3000|3727)\b'
-> # *:3000  uid:115  cgroup:/system.slice/forgejo.service   ← 系统服务 Forgejo，不要动
-> # 127.0.0.1:3727  users:(("hub",pid=…)) uid:1001          ← 本项目后端
-> ```
-
-### 8.3 用 curl 调试认证（走 Bearer，无需处理 Cookie）
+Go 缓存路径（本机沙箱不允许写 `~/.cache` 与 `~/go`）：
 
 ```bash
-# 1. 登录拿 token（dev 模式，需 [dev] enabled = true 且未配 OAuth）
-TOKEN=$(curl -s -X POST http://127.0.0.1:3727/api/v1/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"github_user":"localdev"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"])')
+export GOCACHE=$PWD/.devtools/gocache \
+       GOMODCACHE=$PWD/.devtools/gomodcache \
+       GOPATH=$PWD/.devtools/gopath
+```
+
+### 9.3 用 curl 调试
+
+**Bearer 方式**（无需处理 Cookie）：
+
+```bash
+# 1. 登录拿 token（需 [dev] enabled = true 且未配 OAuth）
+curl -s -X POST localhost:3727/api/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{"github_user":"alice"}'
 
 # 2. 带 Bearer 访问
-curl -s http://127.0.0.1:3727/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
+curl -s localhost:3727/api/v1/auth/me -H "Authorization: Bearer <token>"
 
-# 3. 写请求（注意：带 Origin 时会被 CSRF 校验，CLI 不带 Origin 即放行）
-curl -s -X POST http://127.0.0.1:3727/api/v1/repos \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"demo","tags":[{"tag":"v1","os":"linux","arch":"amd64",
-       "sources":[{"type":"github","url":"https://github.com/a/b","priority":1}]}]}'
+# 3. 写请求（CLI 不带 Origin 即放行 CSRF）
+curl -s -X POST localhost:3727/api/v1/repos \
+  -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"name":"demo","tags":[]}'
 ```
 
-### 8.4 用 curl 调试 Cookie 会话（模拟浏览器）
+**Cookie 方式**（模拟浏览器，`Origin` 必须是白名单里的值）：
 
 ```bash
-# Origin 必须是后端白名单里的前端站点（即 [site] frontend_url，本机示例 3011）
-curl -s -c cookies.txt -X POST http://127.0.0.1:3727/api/v1/auth/login \
-  -H 'Origin: http://localhost:3011' -H 'Content-Type: application/json' \
-  -d '{"github_user":"localdev"}'
-
-curl -s -b cookies.txt http://127.0.0.1:3727/api/v1/auth/me
+curl -s -c jar.txt -X POST localhost:3011/api/v1/auth/login \
+  -H 'Content-Type: application/json' -H 'Origin: http://localhost:3011' \
+  -d '{"github_user":"alice"}'
+curl -s -b jar.txt localhost:3011/api/v1/auth/me
 ```
 
-### 8.5 常见问题
+### 9.4 常见问题
 
-| 症状 | 原因 / 处理 |
+| 症状 | 原因 |
 |---|---|
-| 登录后仍显示未登录 | `[session] cookie_secure = true` 却在 `http://localhost` 下访问 → 浏览器丢弃 Cookie；本地应设 `false`（配置不匹配时启动即报错） |
-| 写请求 401 | 前端漏了 `credentials: 'include'` → 统一走 `apiWrite()` |
-| 写请求 403 `cross-site request blocked` | 请求 `Origin` 不在 `[site] frontend_url` / `extra_origins` 白名单 |
-| `/auth/login` 返回 503 | 未配 OAuth 凭证且 `[dev] enabled` 未开 → 补凭证或临时开启 dev |
-| dev 登录返回 409 | 用户名已被占用（L7 防护）；换一个用户名 |
-| 端口 `EADDRINUSE` | 旧进程未退出。先 `ss -ltnpe` 看**归属**再动手：`uid:`/`cgroup:` 能说明是谁占用（如 `forgejo.service`），`users:(("hub",pid=…))` 则是本项目后端，可用 `pkill -f 'go run ./cmd/hub'` 清理 |
-| 前端起不来 / 打开 `localhost:3000` 不是本站 | **3000 是 Forgejo**，不是 Boxli 前端；换端口（如 `PORT=3011`）并同步 `[site] frontend_url` |
-| 登录后回跳到 Forgejo 页面 | `[site] frontend_url` 仍指向 3000（Forgejo）→ 改为前端实际端口 |
-| `.bin/nuxt` 权限拒绝 | 用 `node node_modules/nuxt/bin/nuxt.mjs` 直接运行 |
+| `pattern all:dist: no matching files found` | 没先构建前端。跑 `make frontend` |
+| 页面 200 但静态资源 404 | `go:embed` 少了 `all:` 前缀（见第七节） |
+| 登录成功但仍显示未登录 | `cookie_secure` 与协议不匹配（http 下必须 false） |
+| 写请求 403 | `Origin` 不在 `[site] frontend_url` 白名单里 |
+| `/docs` 返回 500 | jsdom 补丁失效（jsdom 升级了），看第七节的表格 |
+| 前端起不来 | 端口冲突，换一个（见下） |
+
+> **端口 3000 被 Forgejo 占用**（`forgejo.service`，系统服务）。前端开发用 **3011**，
+> 并同步改 `[site] frontend_url`。排查占用：
+>
+> ```bash
+> ss -ltnpe | grep :3000     # 读 uid:/cgroup: 判断归属
+> ```
 
 ---
 
-## 九、测试与验证
-
-### 9.1 自动化测试
+## 十、测试
 
 ```bash
-cd backend && go test ./... -count=1 -v
+make test                              # 全部
+cd backend && go test ./internal/web/ -v   # 单个包
 ```
 
-**8 个用例组**（另有 **13 个子例**），全部通过：
+**31 个测试函数，5 个包**：
 
-| 用例 | 覆盖 |
-|---|---|
-| `TestOriginAllowed`（11 例） | 同源匹配、端口/scheme 差异、前缀绕过（`boxli.dev.evil.com`）、`null`、空值 |
-| `TestOriginGuard`（10 子例） | 同源放行、跨站拦截、仿前缀拦截、`null` 拦截、无 Origin 放行、Referer 回退（同源/跨站）、DELETE 拦截、GET 放行、OPTIONS 放行；并断言**被拦截请求不得到达处理器** |
-| `TestSessionTokenFrom`（3 子例） | Cookie 优先、回退 Bearer、两者皆空 |
-| `TestSetAndClearSessionCookie` | `HttpOnly` / `Secure` / `SameSite=Lax` / `Path=/`；登出 `MaxAge<0` 且值为空 |
-| `TestSafeRedirectPath`（13 例） | 站内路径放行；`//evil.com`、绝对 URL、反斜杠、CRLF、`javascript:`、无前导斜杠全部拒绝 |
-| `TestStateConsumeIsSingleUse` | state 单次消费 |
-| `TestStateRejectsUnknownAndEmpty` | 伪造 / 空 state |
-| `TestStateExpiredRejected` | 过期 state |
-
-前端：`eslint .` **0 error / 0 warning**；`nuxt build` 成功。
-
-### 9.1.1 文档站验证
-
-生产构建（`node .output/server/index.mjs`，:3077）下的脚本化校验：
-
-| 项 | 方法 | 结果 |
+| 包 | 数量 | 覆盖 |
 |---|---|---|
-| 路由可用 | 逐个请求 7 个 `/docs*` 路径 | ✅ 全部 200 |
-| 标题正确 | 比对渲染出的 `<h1>` 与 `<title>` | ✅ 与 `DOC_PAGES` 一致 |
-| 内部链接 | 提取全部 `href="/docs…"` 并逐条解析 | ✅ **51 条全部可达** |
-| 跨页深链 | 校验「目标页面存在 **且** 目标锚点存在」 | ✅ `missing = none` |
-| 标题锚点 | 检查 `##` 是否带 `id`、重复标题是否去重 | ✅ 如 `cli-与-hub-的对接现状` |
-| README 回归 | 确认详情页 README 标题**不带** `id` | ✅ 行为未变 |
-| 既有页面回归 | `/`、`/explore`、`/search`、`/about`、`/login`、`/submit`、`/dashboard` | ✅ 全部 200 |
-| 手机端静态断言 | viewport / `100dvh` / 无 `100vh` / `overflow-x-hidden` / safe-area | ✅ 7 页全通过 |
-| 触控与字号 | 按钮 ≥44px、输入框 `text-base`、无 `group-hover` | ✅ 全通过 |
-| XSS 防护 | 构造 `<script>` / `<img onerror>` / `<iframe>` 载荷 | ✅ 无可执行节点 |
+| `config` | 10 | 默认值、未知键拒绝、校验、日志脱敏、`frontend_url` 规范化 |
+| `auth` | 9 | 来源白名单、OriginGuard、Cookie 属性、state 单次消费/伪造/过期、开放重定向、令牌随机性与恒定时间比较 |
+| `hub` | 7 | 引导页自包含性、令牌校验（含前后缀不匹配）、作废、方法限制 |
+| `localauth` | 3 | 用户名校验（含中文/emoji/路径字符拒绝）、密码强度、错误类型 |
+| `web` | 2 | **embed 完整性**（含 `_nuxt`）、SSR bundle 体积 |
 
-### 9.2 已实测的行为（curl，2026-10-02）
+> `internal/auth` 的 state 测试需要数据库（读 `hub.toml` 的 `[db] url`），
+> 连不上会自动 **skip**，不影响无库环境。
+>
+> `web` 包的两个测试断言的是**真实构建产物**。CI 的 test job 不做前端构建，
+> 因此会 `-skip` 它们、改在 build job（前端构建完成后）执行。
 
-| 类别 | 场景 | 结果 |
-|---|---|---|
-| Cookie | 登录下发 `HttpOnly; SameSite=Lax` Cookie | ✅ |
-| | Cookie 访问 `/auth/me` | ✅ 200 |
-| | 无凭证 | ✅ 401 |
-| | 登出清 Cookie + 旧会话失效 | ✅ |
-| CSRF | 跨站 Origin 写请求 | ✅ 403 |
-| | 同源 Origin 写请求 | ✅ 通过 |
-| | `OPTIONS` 预检 | ✅ 204 |
-| 回调 | 伪造 / 缺失 state | ✅ 302 `invalid_state` |
-| | 用户拒绝 | ✅ 302 `access_denied`，state 已消费 |
-| | state 重放 | ✅ 仍 302 `invalid_state` |
-| | **完整链路**：302 → `/login?error=…` → 中文提示 | ✅ |
-| | token 是否出现在 URL | ✅ **否** |
-| 写接口 | 提交 2 标签、其中 1 标签含 **3 源** | ✅ 201，**3 源全部落库**，priority/region 正确 |
-| | `PUT` 整体替换 | ✅ 200，旧标签与新源按语义替换 |
-| | `DELETE` 级联 | ✅ 200，删除后 404 |
-| | 非 owner 改 / 删 | ✅ 403 / 403 |
-| | 空 tags | ✅ 400 |
-| 其它 | dev 登录默认关闭 | ✅ 503 且**未创建用户** |
-| | 数据复原 | ✅ 回到种子基线（5 users / 5 repos / 10 tags / 17 sources） |
+### 尚未验证（不得视为已验收）
 
-### 9.3 ⚠️ 尚未验证的部分（不得视为已验收）
-
-| 项 | 状态 |
-|---|---|
-| **真实 GitHub 授权端到端** | ❌ **未完成** —— 与端口无关（见 [11.1](#111-本机端口约束务必遵守)），但仍需人工点一次授权 |
-| 真实浏览器 / 真机测试 | ❌ 未做。全部页面均为**静态断言** |
-| `CopyButton` 宽度修复复测 | ❌ 未复测 |
-| Lighthouse Mobile ≥ 90 | ❌ 从未测量 |
-| 真实触摸延迟、iOS 滚动惯性、`100dvh` 动态表现、iOS 聚焦 | ❌ 未验证 |
-| 文档站 7 个页面的真实浏览器阅读体验 | ❌ 未做（同样只有静态断言） |
-
-以上需用真实浏览器或真机补齐（见 [11.3](#113-手机端验收待做)）。
+- **真实 GitHub OAuth 端到端** —— 需人工点一次授权
+- **手机端真机 / Lighthouse** —— 现有仅为静态断言（viewport、`100dvh`、44px 触控类名）
+- **生产服务器实际部署**
 
 ---
 
-## 十、安全设计汇总
+## 十一、安全设计
 
-| 威胁 | 防护 | 位置 |
-|---|---|---|
-| XSS 窃取会话 | httpOnly Cookie（JS 不可读） | `auth/cookie.go` |
-| CSRF | `SameSite=Lax` + `OriginGuard` 精确同源校验 | `auth/origin.go` |
-| 来源伪造（前缀绕过） | `url.Parse` 比较 scheme+host，非前缀匹配 | `auth/origin.go` |
-| 开放重定向 | `safeRedirectPath` 仅放行站内相对路径 | `hub/handlers_auth.go` |
-| CRLF / 响应头注入 | 回跳路径拒绝 `\r` `\n` `\` | 同上 |
-| OAuth CSRF / 授权码重放 | state 一次性原子消费（`DELETE ... RETURNING`） | `auth/state.go` |
-| 账号接管 | username 冲突返回 409，**不退化查找** | `hub/handlers_auth.go` |
-| 会话伪造 / 盗用 | JWT HS256 签名 + `sessions` 表哈希校验 + 可吊销 | `auth/auth.go` |
-| 本地调试后门流入生产 | `[dev] enabled` **默认关闭**，且设为 `true` 时程序拒绝启动 | `config/config.go` |
-| Markdown XSS | `markdown-it(html:false)` + DOMPurify 清洗 | `composables/useMarkdown.ts` |
-| 外链劫持 | 自动补 `rel="noopener noreferrer nofollow"` | 同上 |
-| 请求体过大 | `http.MaxBytesReader` 限制 1 MiB | `hub/server.go` |
-| 后端端口暴露 | 仅监听 `127.0.0.1:3727` | `config/config.go` |
-| 数据库端口暴露 | 仅监听 `127.0.0.1:5432` | PG 启动参数 |
-| 越权修改 | owner 校验 → 403 | `hub/store_write.go` |
-
-**待处理（上线前）**：
-
-- **L6**：无速率限制、无请求 ID 日志
-- **L5 收尾**：生产由 Nginx 同源反代后移除 CORS 头
-- **轮换 `[github] secret`**：该 secret 曾以明文外泄，**上线前必须在 GitHub Regenerate**
+| 威胁 | 防护 |
+|---|---|
+| XSS 读取会话 | Cookie `HttpOnly` |
+| CSRF | `SameSite=Lax` + `OriginGuard` 精确比对 |
+| 开放重定向 | `safeRedirectPath` 只允许站内相对路径 |
+| OAuth state 重放 | `DELETE ... RETURNING` 原子消费 |
+| 账号接管 | `upsertUser` 冲突时返回 409，**不退化查找** |
+| README XSS | `markdown-it(html:false)` + DOMPurify |
+| 用户名枚举 | 统一错误信息 + bcrypt 耗时拉平 |
+| 管理员抢注 | 一次性令牌（仅日志可见）+ 事务内判定 |
+| 请求体过大 | `http.MaxBytesReader`：写接口 1 MiB，登录接口 64 KiB |
+| 密钥泄漏 | 配置摘要日志脱敏（`StringRedactsSecrets` 测试守住） |
+| 孤儿进程 | `Setpgid` + `Pdeathsig` |
 
 ---
 
-## 十一、已知限制与后续工作
+## 十二、已知限制
 
-### 11.1 本机端口约束（务必遵守）
-
-本机 `:3000` 属 **Forgejo**（`forgejo.service`，uid 115，systemd 开机自启），
-**与 Boxli 前端无关**。因此：
-
-- **前端不能用 3000**，改用 **3011** 或 **3077**（`:3001` 属 docker-proxy）
-- `hub.toml` 的 **`[site] frontend_url` 必须与前端实际端口一致**
-
-该字段身兼两职，写错会同时坏两件事：
-
-| 故障 | 原因 |
+| 限制 | 说明 |
 |---|---|
-| OAuth 成功后 **302 落到 Forgejo** 而非本站 | `[site] frontend_url` 即 302 回跳目标 |
-| 真实前端的**写请求被 403 拒绝** | 同一字段也是 `OriginGuard` 的 CSRF 来源白名单 |
+| **无限流** | 登录/写接口可被暴力刷，尚未实现 rate limit |
+| **无请求 ID** | 日志只有 `method path`，无法串联单次请求 |
+| **`/health` 不探数据库** | 恒返 healthy，数据库挂了监控不会告警 |
+| **管理员无后台** | `is_admin` 仅作标记，没有管理界面 |
+| **无改密码 UI** | `SetPassword()` 已实现，但未暴露接口与页面 |
+| **无备份脚本** | 需自行配置（见 `DEPLOYMENT.md`） |
+| **`BOXLI_DATA_DIR` 为死代码** | 从未被读取；若将来接入 blob 存储需重新实现 |
 
-```toml
-[site]
-frontend_url = "http://localhost:3011"
-```
-
-**排查端口归属时用 `ss -ltnpe`**，读 `uid:` 与 `cgroup:` 字段：
-
-```bash
-ss -ltnpe | grep -E ':(3000|3727)\b'
-# *:3000           uid:115   cgroup:/system.slice/forgejo.service  ← Forgejo，不得清理
-# 127.0.0.1:3727   uid:1001  users:(("hub",pid=937975,fd=6))       ← 本项目后端
-```
-
-> **⚠️ `ss -ltnp` 会误导**：它对**其他用户**持有的 socket 不解析 PID，输出里没有
-> `users:(...)`。曾据此误判 Forgejo 占用的 3000 为「本项目的孤儿 socket」——
-> 实际是「属主是别的用户，当前用户无权解析」。**判定归属必须看 `uid:`/`cgroup:`**。
-
-> 该约束**不影响代码正确性**：Cookie 会话、302 回跳、CSRF、state 一次性消费、
-> 完整 CRUD 与权限校验均已 curl 逐项实测通过（见 [9.2](#92-已实测的行为curl2026-10-02)）。
-
-### 11.2 文档站 `/docs`（已完成）
-
-- [x] 文档路由与侧边导航（桌面 sticky + 手机折叠目录 + 本页小节锚点 + 上下页翻页）
-- [x] 快速开始、安装、`pull`/`run` 命令、镜像格式说明、FAQ（共 7 个页面）
-- [x] 手机端阅读体验（折叠目录、横向滚动 chip/表格/代码块、16px 正文）
-- [x] 标题锚点深链（`slugify` + `heading_open`，`anchors` 选项控制，README 行为不变）
-
-实现细节见 [6.8 文档站](#68-文档站)。
-
-**验证**：7 个路由全部 200；51 条内部链接与跨页深链逐条校验通过；
-`eslint` 0 error / 0 warning；`nuxt build` 成功。
-
-> **⚠️ 手机端仍为静态断言**（viewport、`100dvh`、`overflow-x-hidden`、44px 触控、
-> 16px 输入框、无 hover-only），**未做真实浏览器/真机测试**，
-> 真实验收属 [11.3](#113-手机端验收待做)。
-
-> **⚠️ 内容准确性**：命令与 flag 抄录自真实 `boxli` 二进制（`0.0.0-dev`，实际 28 个子命令），
-> 镜像引用为 `NAME:VERSION`（无命名空间段），`pull` 为双语义。
-> 实测确认本机 `boxli` 对接的是**另一套 Hub**（`boxli hub serve`），
-> 与本站 `/api/v1/*` 并非同一实现 —— 已在 `/docs/faq` 首节如实标注，
-> 且不提供无法执行的示例。**CLI 与本站 Hub 的对接为后续工作项。**
-
-### 11.3 手机端验收（待做）
-
-需重新准备浏览器环境（或真机 / BrowserStack），补齐 [9.3](#93-尚未验证的部分不得视为已验收) 全部项。
-
-### 11.4 部署上线（待做）
-
-> 完整步骤见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)，此处仅列要点。
-
-- Nginx：前端 SSR 反代 + `/api/` 反代
-  （**注意：`/docs` 就是 Nuxt 路由，没有独立的静态目录**）
-- Let's Encrypt HTTPS
-- systemd：`boxli-hub.service` + 前端服务
-- **`[session] cookie_secure = true`**（生产 HTTPS 必须；配 `http://` 会拒绝启动）
-- **`[site] frontend_url = "https://boxli.dev"`**，并同步更新 GitHub App 登记的 production 回调地址
-- **Regenerate `[github] secret`**
-- ufw 只开 80/443；确认 3727/5432 不可达
-- 每日数据库备份 + 定时任务
-- 移除 CORS 头（同源反代后不再需要）
-- L6：按需加限流与请求 ID 日志
-
-### 11.5 设计取舍备忘
-
-| 取舍 | 选择与理由 |
-|---|---|
-| 会话载体 | **httpOnly Cookie** 而非 localStorage（防 XSS）或换取码（仍经地址栏） |
-| state 存储 | **数据库**而非内存：多实例可校验、进程重启不丢失 |
-| 会话模型 | JWT + sessions 表双写：无状态签名 + 可即时吊销 |
-| 鉴权来源 | Cookie **与** Bearer 并存：浏览器安全、CLI 便利 |
-| 登录守卫时机 | **仅客户端**：Cookie 不参与 SSR，服务端判定会误判已登录用户 |
-| 更新语义 | tags/sources **整体替换**：实现简单、语义明确；代价是前端必须全量回填 |
-| 优先级表达 | 由**数组顺序**决定：避免用户手填 `priority` 与顺序矛盾 |
-| 来源校验 | `url.Parse` 精确比较，而非前缀匹配（防前缀绕过） |
-| 文档内容载体 | **Markdown 常量 + 数据驱动导航**：复用 README 的安全渲染链路，页面仅为薄壳，标题/导航/翻页单点维护 |
-| 标题锚点开关 | `anchors` **选项控制**：文档站开启、README 关闭，避免改变既有渲染行为 |
-| 文档内容口径 | **以真实 CLI 为准**（抄录 `--help`），不按规格臆造；CLI 与本站 Hub 的差异**如实标注**而非掩盖 |
-
----
-
-**有不清楚的随时问。**
+> 立项时的分阶段计划存档在 `plants.md`。其中的规格**已多次被推翻**，
+> 不作为现行依据 —— 本仓库的三份文档才是。
