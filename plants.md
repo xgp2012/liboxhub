@@ -69,7 +69,7 @@
 | 数据库 | PG 16，系统安装 | **PG 17.11 免安装二进制**，工作区内自建实例 |
 | 数据库监听 | — | 仅 `127.0.0.1:5432`（无对外暴露） |
 | 权限 | 有 sudo | **无 sudo**（沙箱 `NoNewPrivs: 1`，无法提权） |
-| 前端 dev | 3000 | 3000（另有生产预览 3011 用于验收） |
+| 前端 dev | 3000 | **不能再用 3000**（该端口属系统服务 Forgejo）；改用 **3011** 等空闲端口，并同步 `BOXLI_FRONTEND_URL` |
 
 > 迁移消除了阶段 2 的 L1/L2/L8（WSL PG 全接口监听、`pg_hba` 全放行、Windows 防火墙规则）。
 > 详见 README「本地开发」与环境变量一节。
@@ -716,10 +716,14 @@ import Table from 'fuxsto-design/table'
 
 ### 前端本地开发
 
+> **⚠️ 本机（Ubuntu 22.04 开发机）不能用 3000 端口** —— `:3000` 属系统服务 **Forgejo**
+> （`forgejo.service`，uid 115，开机自启）。请改用空闲端口（**3011** / **3077**），
+> 并**同步设置后端 `BOXLI_FRONTEND_URL`** 指向该端口，否则 OAuth 回跳落错站点、写请求被 CSRF 403。
+
 ```bash
 npm install
-npm run dev
-# http://localhost:3000
+PORT=3011 npm run dev
+# http://localhost:3011
 
 # .env
 NUXT_PUBLIC_API_BASE=https://boxli.dev/api/v1
@@ -742,8 +746,8 @@ export default defineNuxtConfig({
 ### 真机调试
 
 ```bash
-npm run dev -- --host 0.0.0.0
-# 手机浏览器访问 http://电脑局域网IP:3000
+PORT=3011 npm run dev -- --host 0.0.0.0
+# 手机浏览器访问 http://电脑局域网IP:3011
 ```
 
 ### API 调用
@@ -807,6 +811,10 @@ export const getRepo = (ns: string, repo: string) =>
 - [x] 建立目录结构与代码规范（eslint / gofmt）
 
 **验证**：`npm run dev` 首页空白可开；`curl localhost:3000/api/v1/health` 返回 200
+
+> **📌 端口说明（2026-10-03 补注）**：上句的 `localhost:3000` 属**迁移前**的 Windows + WSL2 环境
+> （见下方「环境说明」），当时 3000 可用。**迁移到原生 Linux 后 3000 已被系统服务 Forgejo 占用**，
+> 前端须改用 **3011** 等空闲端口 —— 详见「前端本地开发」与阶段 4「阻塞项」。
 
 > **实际产出与验证记录：**
 >
@@ -1084,7 +1092,8 @@ export const getRepo = (ns: string, repo: string) =>
 - [x] `/dashboard`：管理自己的镜像（列表 / 删除 / 编辑）
 - [x] 前端鉴权状态管理、未登录跳转（`useAuth` + `auth` 中间件）
 - [ ] **真实授权联调**：人工点一次授权链接完成端到端登录
-      —— ⚠️ **未完成**，被端口占用阻塞，详见下方「阻塞项」
+      —— ⚠️ **仍未完成**，但**端口占用阻塞已于 2026-10-03 解除**
+      （陈旧进程已清理；前端需换非 3000 端口，详见下方「阻塞项」）
 
 **验证**：真登录提交一个多源镜像，`/explore` 可见，可编辑删除
 
@@ -1105,7 +1114,7 @@ export const getRepo = (ns: string, repo: string) =>
    采用 **`SameSite=Lax` + `OriginGuard` 双层**：前者是浏览器层，后者是应用层（不依赖浏览器实现）。
    用 Lax 而非 Strict，是为了让「从 GitHub 跳回本站」的顶层导航能带上 Cookie。
 2. **精确同源比对**：`OriginGuard` 用 `url.Parse` 比较 scheme+host，
-   **不能**用 `strings.HasPrefix` —— 否则 `http://localhost:3000.evil.com` 会被误判为可信。
+   **不能**用 `strings.HasPrefix` —— 否则（前端在 3011 时）`http://localhost:3011.evil.com` 会被误判为可信。
 3. **开放重定向防护**：登录后回跳地址由前端传入，`safeRedirectPath` 只放行站内相对路径，
    拒绝 `//evil.com`、`https://evil.com`、`javascript:` 与 CRLF 注入。
 
@@ -1209,35 +1218,72 @@ export const getRepo = (ns: string, repo: string) =>
 > **⚠️ 本次仍为静态断言**，与阶段 3 一致：**未做真实浏览器/真机测试**。
 > `CopyButton` 复测、Lighthouse Mobile、真实触摸与 iOS 行为等仍属**阶段 6**，不得视为已验收。
 
-#### ⚠️ 阻塞项：真实授权联调未完成（2026-10-02）
+#### ✅ 阻塞项：端口占用已清理（2026-10-03 更新；原诊断有误，已更正）
 
-代码与可自动化验证的部分**已全部通过**，但「人工点一次授权链接」这一步**尚未完成**，
-原因是**端口被孤儿进程占用**（会话早期被 kill 的进程，其 socket 仍占着端口，
-且属主进程在当前 PID 命名空间中不可见，无法清理）：
+> **📌 结论**：原先记录的「端口被孤儿进程占用」**阻塞已解除**，
+> 但**原诊断是错的**，本节按实测重写。真实授权联调本身**仍需人工点一次**。
 
-| 端口 | 占用情况 | 影响 |
+**❌ 原记录（2026-10-02）的说法**
+
+> 「`127.0.0.1:3727` 与 `localhost:3000` 被**孤儿进程**占用（会话早期被 kill 的进程，
+> socket 仍占端口且属主在当前 PID 命名空间不可见，无法清理）；且跑的是陈旧配置/构建。」
+
+**✅ 实测（2026-10-03）**
+
+| 端口 | 原记录 | 实测真相 |
 |---|---|---|
-| `127.0.0.1:3727` | 孤儿进程，配置陈旧（`BOXLI_FRONTEND_URL=http://localhost:3000`） | **GitHub App 登记的回调只能是此端口**，故真实登录必须由它承接 |
-| `localhost:3000` | 陈旧构建（`/login` `/submit` `/dashboard` 均 404） | 即使回调成功，302 落点会是 404 |
+| `127.0.0.1:3727`、`:3740`、`:3750` | 孤儿进程，无法清理 | **不是孤儿**：**5 组重复的 `go run ./cmd/hub`**（父 + `hub` 子进程共 10 个），属主 `uid=1001` **完全可见**，`kill` 正常可用 |
+| `localhost:3000` | 陈旧的前端构建（`/login` `/submit` `/dashboard` 均 404） | **根本不是 Boxli 前端**：属 **Forgejo**（`forgejo.service`，`uid:115`，systemd `enabled` + `active`，长期占用）。那些 200/303/404 **全是 Forgejo 的响应** |
 
-磁盘上的构建产物是**最新**的（`.output` 含三个新页面），纯粹是**运行中的进程陈旧**。
-
-**解除方式**（需在能看见这些进程的终端执行）：
+**误判根源（值得记下）**：`ss -ltnp` 对**其他用户**持有的 socket **不解析 PID**，
+输出里没有 `users:(...)`。原记录把「看不到属主」直接当成「属主不可见 / 孤儿 socket」。
+正确判据是用 `ss -ltnpe` 读 **`uid:` 与 `cgroup:`**：
 
 ```bash
-pkill -f 'exe/hub'
-pkill -f '.output/server/index.mjs'
-
-# 后端（回调落点指向前端）
-cd backend && set -a && . ./.env && set +a
-export BOXLI_FRONTEND_URL=http://localhost:3000
-go run ./cmd/hub
-
-# 前端
-cd frontend && PORT=3000 node .output/server/index.mjs
+ss -ltnpe | grep -E ':(3000|3727|3740|3750)\b'
+# *:3000           uid:115   cgroup:/system.slice/forgejo.service   ← Forgejo，与项目无关
+# 127.0.0.1:3727   uid:1001  users:(("hub",pid=937975,fd=6))        ← 本项目后端，属主可见
 ```
 
-随后访问 `http://localhost:3000/login` 完成一次授权，即可补齐端到端验证。
+**已执行的清理（2026-10-03）**
+
+```bash
+pkill -f 'go run ./cmd/hub'     # 清掉 5 组重复实例（父 + 子共 10 个进程）
+```
+
+- 10 个进程全部 **SIGTERM 干净退出**（无需 SIGKILL）；`:3727` / `:3740` / `:3750` **已释放**
+- **PostgreSQL 保留**（`:5432`，项目依赖），数据基线未变：**5 users / 5 repos / 10 tags / 17 sources**
+- **`:3000` 未动** —— Forgejo 系统服务，**不属本项目，不得清理**
+
+**⚠️ 连带必须修正：前端端口与 `BOXLI_FRONTEND_URL`**
+
+`:3000` 长期被 Forgejo 占用 ⇒ **Boxli 前端在本机不能用 3000**。
+而 `BOXLI_FRONTEND_URL` 的默认值恰是 `http://localhost:3000`
+（`config.go`：`getenv("BOXLI_FRONTEND_URL", "http://localhost:3000")`），`backend/.env` 也未覆盖它。
+该变量**同时**决定两件事，因此默认值在本机是**双重错误**：
+
+| 故障 | 原因 |
+|---|---|
+| OAuth 成功后 **302 落到 Forgejo** | 该变量是回跳目标站点 |
+| 真实前端**写请求被 403** | 该变量也是 `OriginGuard` 的 CSRF 来源白名单，里面是 Forgejo 的 origin |
+
+**解除方式**（前端换端口，后端指向同一端口）：
+
+```bash
+# 后端：回跳落点 + CSRF 白名单都指向前端实际端口（示例 3011）
+cd backend && set -a && . ./.env && set +a
+export BOXLI_FRONTEND_URL=http://localhost:3011
+go run ./cmd/hub
+
+# 前端：显式指定非 3000 端口
+cd frontend && PORT=3011 node .output/server/index.mjs
+```
+
+随后访问 `http://localhost:3011/login` 完成一次授权，即可补齐端到端验证。
+
+> **GitHub App 登记无需改动**：回调仍是 `http://127.0.0.1:3727/api/v1/auth/callback`（后端承接），
+> 变的只是前端端口与 `BOXLI_FRONTEND_URL`。
+> 空闲端口参考：**3011**、**3077**（`:3000` 属 Forgejo，`:3001` 属 docker-proxy）。
 
 > 该阻塞**不影响代码正确性**：Cookie 会话、302 回跳、CSRF、state 一次性消费、
 > 完整 CRUD 与权限校验均已用 curl 逐项实测通过（见上表）。
@@ -1397,7 +1443,8 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 > 阶段 3 已完成（2026-10-02）；**阶段 5 已完成（2026-10-02）**；
 > **阶段 4 代码已全部完成**：后端 OAuth + 302 回跳 + httpOnly Cookie 会话 + CSRF 来源校验 +
 > 开放重定向防护 + dev 登录开关；前端 `/login`、`/submit`、`/dashboard` + 鉴权状态管理全部落地。
-> **唯一未完成项是「人工点一次真实授权」**（被端口占用阻塞，见阶段 4 末尾），
+> **唯一未完成项是「人工点一次真实授权」**（原「端口占用」阻塞已于 2026-10-03 清理并更正诊断，
+> 见阶段 4 末尾），
 > 其余（Cookie 会话、302 链路、CSRF、state 一次性消费、完整 CRUD 与权限）均已 curl 实测通过。
 >
 > **阶段 5 已完成**：`/docs` 文档站 7 个页面（快速开始 / 安装自检 / 拉取运行 /
@@ -1412,12 +1459,18 @@ cd frontend && PORT=3000 node .output/server/index.mjs
 > **L3/L4/L7 已于阶段 4 修复**；**L5 已部分推进**（跨源 CORS 改为白名单回显 + 凭证支持，
 > 生产由 Nginx 同源反代后彻底移除）；剩余 **L6 为安全加固，阶段 7 处理**。
 >
-> **⚠️ 阶段 4 剩余阻塞项**：
+> **⚠️ 阶段 4 剩余事项**：
 > 1. ~~`BOXLI_GITHUB_REDIRECT` 需在 GitHub 侧对齐~~ —— **✅ 已解除**：App 登记值即
 >    `http://127.0.0.1:3727/api/v1/auth/callback`，复测通过（早期误判系保存生效前探测所致）
 > 2. **`BOXLI_GITHUB_SECRET` 已外泄** —— 上线前必须在 GitHub Regenerate（阶段 7）
-> 3. **真实授权联调未完成** —— 3727 / 3000 被孤儿进程占用且配置陈旧，
->    需重启服务后人工点一次授权（详见阶段 4 末尾「阻塞项」）
+> 3. ~~端口被「孤儿进程」占用~~ —— **✅ 已解除（2026-10-03）**：实测**并非孤儿**，
+>    而是 **5 组重复的 `go run ./cmd/hub`**（属主 `uid=1001` 可见），已 SIGTERM 全部清理，
+>    `:3727` / `:3740` / `:3750` 释放。**`localhost:3000` 实为系统服务 Forgejo**，与本项目无关
+>    （原「陈旧前端构建」结论系误判）。
+>    **⚠️ 连带结论：前端不能再用 3000，且 `BOXLI_FRONTEND_URL` 必须显式指向新端口**
+>    （该变量同时决定 OAuth 回跳落点与 CSRF 白名单，用默认值会导致回跳落 Forgejo、写请求 403）
+> 4. **真实授权联调仍未完成** —— 但**已无端口阻塞**，只差人工点一次授权
+>    （详见阶段 4 末尾「阻塞项」）
 >
 > **阶段 3 遗留到阶段 6 的验证项**（**手机测试被跳过，不得视为已验收**）：
 > - `CopyButton` 宽度修复（`min-w-11`）**未经复测**
