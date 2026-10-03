@@ -1,9 +1,21 @@
 # Boxli Hub 开发文档
 
-> 面向开发者的技术实现说明。项目计划与阶段进度见 [`plants.md`](./plants.md)，
-> 环境搭建与快速上手见 [`README.md`](./README.md)。
+> 面向开发者的**技术实现说明**：架构、模块职责、认证实现、API 细节、调试与安全设计。
 >
 > 本文档描述**当前代码的实际实现**，并明确标注哪些行为已被实测验证、哪些仅做过静态检查。
+
+## 文档分工
+
+| 文档 | 回答什么问题 | 受众 |
+|---|---|---|
+| [`README.md`](./README.md) | **怎么把它跑起来** —— 环境准备、启动步骤、配置字段、API 简表 | 初次接触项目的人 |
+| 本文档 | **它是怎么实现的** —— 架构、设计理由、实现细节、调试与测试 | 改代码的人 |
+| [`DEPLOYMENT.md`](./DEPLOYMENT.md) | **怎么上线** —— 构建、systemd、Nginx、HTTPS、备份 | 运维 / 部署者 |
+| [`plants.md`](./plants.md) | 立项时的分阶段计划 | **历史存档，仅作考据** |
+
+> **⚠️ `plants.md` 含已被推翻的规格**（错误的 systemd `ExecStart`、SSG 方案、`:3000` 端口
+> 误判等），**不作为现行依据**。本文档与 `DEPLOYMENT.md` 描述的是实际实现，
+> 冲突时以那两者为准。
 
 ---
 
@@ -13,13 +25,13 @@
 2. [目录与模块职责](#二目录与模块职责)
 3. [数据模型](#三数据模型)
 4. [后端实现](#四后端实现)
-5. [认证与会话（阶段 4 核心）](#五认证与会话阶段-4-核心)
+5. [认证与会话](#五认证与会话)
 6. [前端实现](#六前端实现)
 7. [API 参考](#七api-参考)
 8. [本地开发与调试](#八本地开发与调试)
 9. [测试与验证](#九测试与验证)
 10. [安全设计汇总](#十安全设计汇总)
-11. [已知限制与 TODO](#十一已知限制与-todo)
+11. [已知限制与后续工作](#十一已知限制与后续工作)
 
 ---
 
@@ -30,10 +42,10 @@
     │
     ▼
 ┌─────────────────────────────────┐
-│  Nginx (80/443)                 │  ← 生产环境（阶段 7）
-│  /          → 前端 (Nuxt SSR)    │
-│  /api/*     → 反代到后端          │
-│  /docs/*    → 文档               │
+│  Nginx (80/443)                 │  ← 生产环境
+│  /api/*  → 反代到后端            │
+│  其余路径 → 前端 (Nuxt SSR)      │
+│           （/docs 也是 Nuxt 路由）│
 └──────────────┬──────────────────┘
                │ 127.0.0.1:3727（仅回环，外部不可达）
                ▼
@@ -58,7 +70,7 @@ Hub 只记录「去哪下载」
 | 后端仅监听回环 | `127.0.0.1:3727`，端口扫描不可见 |
 | 数据库仅监听回环 | `127.0.0.1:5432` |
 | 不存储镜像本体 | `sources.url` 只记录外链地址 |
-| 手机优先 | 先写 <640px，再 `md:`/`lg:`（见 `plants.md` 第四节） |
+| 手机优先 | 先写 <640px，再 `md:`/`lg:`（要点见 [6.6](#66-手机优先实现要点)） |
 
 ---
 
@@ -76,11 +88,11 @@ internal/
 │   ├── auth.go              # JWT 签发/校验 + sessions 表读写（存 sid 的 SHA-256）
 │   ├── github.go            # GitHub OAuth：authorize URL / code 换 token / 拉用户
 │   ├── middleware.go        # 鉴权中间件：解析会话 → 注入 context
-│   ├── cookie.go            # 【阶段 4】httpOnly 会话 Cookie 下发/清除/提取
-│   ├── origin.go            # 【阶段 4】CSRF 来源白名单校验
+│   ├── cookie.go            # httpOnly 会话 Cookie 下发/清除/提取
+│   ├── origin.go            # CSRF 来源白名单校验
 │   ├── state.go             # OAuth state 一次性校验（DELETE ... RETURNING）
 │   ├── state_test.go        # state 单次消费 / 伪造 / 过期
-│   └── origin_test.go       # 【阶段 4】来源校验 + Cookie 属性测试
+│   └── origin_test.go       # 来源校验 + Cookie 属性测试
 ├── config/config.go         # TOML 配置加载 + 启动期校验（hub.toml）
 ├── config/config_test.go    # 默认值/未知键/校验/脱敏 断言
 ├── db/
@@ -95,7 +107,7 @@ internal/
 │   ├── handlers_read.go     # 读接口处理器
 │   ├── handlers_write.go    # 写接口处理器
 │   ├── handlers_auth.go     # 登录/回调/me/登出 + upsertUser + 回跳与 Cookie
-│   └── redirect_test.go     # 【阶段 4】开放重定向防护测试
+│   └── redirect_test.go     # 开放重定向防护测试
 └── seed/seed.go             # 种子数据定义
 ```
 
@@ -105,30 +117,30 @@ internal/
 app/
 ├── app.vue                  # 根组件（NuxtLayout + NuxtPage）+ 全局 meta
 ├── layouts/default.vue      # Header + main + Footer，min-h-[100dvh] + overflow-x-hidden
-├── middleware/auth.ts       # 【阶段 4】登录守卫（仅客户端判定）
+├── middleware/auth.ts       # 登录守卫（仅客户端判定）
 ├── components/
 │   ├── SiteHeader.vue       # 导航 + 手机 Drawer + 登录态用户菜单
 │   ├── SiteFooter.vue       # 页脚（safe-area 内边距）
 │   ├── RepoCard.vue         # 镜像卡片
 │   ├── SourceList.vue       # 详情页多源下载列表
-│   ├── SourceEditor.vue     # 【阶段 4】下载源增删改（顺序即优先级）
-│   ├── RepoForm.vue         # 【阶段 4】建仓/改仓共用表单
+│   ├── SourceEditor.vue     # 下载源增删改（顺序即优先级）
+│   ├── RepoForm.vue         # 建仓/改仓共用表单
 │   ├── CopyButton.vue       # 复制按钮（含降级方案）
 │   ├── EmptyState.vue       # 空状态
 │   └── CardSkeleton.vue     # 加载骨架
 ├── composables/
 │   ├── useApi.ts            # 读接口：useFetch + 统一解包 {code,message,data}
-│   ├── useAuth.ts           # 【阶段 4】登录态 + login/logout + apiWrite
+│   ├── useAuth.ts           # 登录态 + login/logout + apiWrite
 │   └── useMarkdown.ts       # markdown-it(html:false) + DOMPurify
 ├── pages/
 │   ├── index.vue            # 首页
 │   ├── explore/index.vue    # 浏览 + 搜索/排序
 │   ├── explore/[ns]/[repo].vue  # 详情
 │   ├── search.vue           # 搜索
-│   ├── login.vue            # 【阶段 4】登录
-│   ├── submit.vue           # 【阶段 4】提交镜像
-│   ├── dashboard.vue        # 【阶段 4】用户中心
-│   ├── docs/                # 【阶段 5】文档站（7 个页面）
+│   ├── login.vue            # 登录
+│   ├── submit.vue           # 提交镜像
+│   ├── dashboard.vue        # 用户中心
+│   ├── docs/                # 文档站（7 个页面）
 │   │   ├── index.vue        #   文档首页
 │   │   ├── quickstart.vue   #   快速开始
 │   │   ├── install.vue      #   安装与自检
@@ -137,13 +149,13 @@ app/
 │   │   ├── submit.vue       #   提交镜像到 Hub
 │   │   └── faq.vue          #   常见问题
 │   └── about.vue            # 关于
-├── types/api.ts             # 后端响应类型（含阶段 4 的 AuthUser/RepoInput 等）
+├── types/api.ts             # 后端响应类型（AuthUser/RepoInput 等）
 └── utils/
     ├── format.ts            # 字节/数量/相对时间格式化 + 源类型元数据 + copyText
-    └── docs.ts              # 【阶段 5】文档内容、导航与标题锚点渲染
+    └── docs.ts              # 文档内容、导航与标题锚点渲染
 ```
 
-**阶段 5 新增组件**：`components/DocsLayout.vue`（文档布局：桌面 sticky 侧边导航 /
+**文档站布局**：`components/DocsLayout.vue`（桌面 sticky 侧边导航 /
 手机折叠目录 / 本页小节锚点 / 上下页翻页）。
 
 ---
@@ -231,7 +243,7 @@ type response struct {
 
 ---
 
-## 五、认证与会话（阶段 4 核心）
+## 五、认证与会话
 
 ### 5.1 会话存储：JWT + sessions 表双写
 
@@ -246,7 +258,7 @@ type response struct {
 
 ### 5.2 会话交付：httpOnly Cookie
 
-阶段 4 定案 —— 回调不再返回裸 JSON，改为 **302 回前端**，会话以 Cookie 下发。
+回调不返回裸 JSON，改为 **302 回前端**，会话以 Cookie 下发。
 
 ```go
 // internal/auth/cookie.go
@@ -447,7 +459,7 @@ function commit(next: SourceRow[]) {
 
 **优先级由顺序决定**，用户无需手填 `priority`，避免顺序与优先级不一致。
 
-### 6.6 手机优先实现要点（阶段 4 新增页面同样适用）
+### 6.6 手机优先实现要点
 
 | 规范 | 实现 |
 |---|---|
@@ -465,7 +477,7 @@ function commit(next: SourceRow[]) {
 - 页脚年份用 `useState` 固定
 - 登录态相关的 DOM 差异**一律在客户端渲染后出现**（SSR 阶段统一按未登录渲染）
 
-### 6.8 文档站（阶段 5）
+### 6.8 文档站
 
 文档站不引入任何新依赖，复用既有渲染链路与组件风格：
 
@@ -599,7 +611,7 @@ go run ./cmd/seed    # 种子数据（幂等）
 
 > **⚠️ 本机不能用 3000 端口** —— 3000 属 **Forgejo**（`forgejo.service`，uid 115，开机自启），
 > 与 Boxli 前端无关。必须换端口（如 3011），并**同步修改 `hub.toml` 的 `[site] frontend_url`**，
-> 否则 OAuth 回跳落错站点、写请求被 CSRF 拦截（403）。见 [11.1](#111-阶段-4-阻塞项已解除)。
+> 否则 OAuth 回跳落错站点、写请求被 CSRF 拦截（403）。见 [11.1](#111-本机端口约束务必遵守)。
 
 ```bash
 cd frontend
@@ -690,7 +702,7 @@ cd backend && go test ./... -count=1 -v
 
 前端：`eslint .` **0 error / 0 warning**；`nuxt build` 成功。
 
-### 9.1.1 文档站验证（阶段 5，2026-10-02）
+### 9.1.1 文档站验证
 
 生产构建（`node .output/server/index.mjs`，:3077）下的脚本化校验：
 
@@ -735,14 +747,14 @@ cd backend && go test ./... -count=1 -v
 
 | 项 | 状态 |
 |---|---|
-| **真实 GitHub 授权端到端** | ❌ **未完成** —— 原「端口占用」阻塞已解除（见 [11.1](#111-阶段-4-阻塞项已解除)），但仍需人工点一次授权 |
-| 真实浏览器 / 真机测试 | ❌ 未做。阶段 3–5 全部为**静态断言** |
+| **真实 GitHub 授权端到端** | ❌ **未完成** —— 与端口无关（见 [11.1](#111-本机端口约束务必遵守)），但仍需人工点一次授权 |
+| 真实浏览器 / 真机测试 | ❌ 未做。全部页面均为**静态断言** |
 | `CopyButton` 宽度修复复测 | ❌ 未复测 |
 | Lighthouse Mobile ≥ 90 | ❌ 从未测量 |
 | 真实触摸延迟、iOS 滚动惯性、`100dvh` 动态表现、iOS 聚焦 | ❌ 未验证 |
-| 文档站 7 个页面的真实浏览器阅读体验 | ❌ 未做（阶段 5 同样只有静态断言） |
+| 文档站 7 个页面的真实浏览器阅读体验 | ❌ 未做（同样只有静态断言） |
 
-以上需在**阶段 6** 用真实浏览器或真机补齐。
+以上需用真实浏览器或真机补齐（见 [11.3](#113-手机端验收待做)）。
 
 ---
 
@@ -766,7 +778,7 @@ cd backend && go test ./... -count=1 -v
 | 数据库端口暴露 | 仅监听 `127.0.0.1:5432` | PG 启动参数 |
 | 越权修改 | owner 校验 → 403 | `hub/store_write.go` |
 
-**待处理（阶段 7）**：
+**待处理（上线前）**：
 
 - **L6**：无速率限制、无请求 ID 日志
 - **L5 收尾**：生产由 Nginx 同源反代后移除 CORS 头
@@ -774,97 +786,58 @@ cd backend && go test ./... -count=1 -v
 
 ---
 
-## 十一、已知限制与 TODO
+## 十一、已知限制与后续工作
 
-### 11.1 阶段 4 阻塞项（已解除）
+### 11.1 本机端口约束（务必遵守）
 
-> **📌 状态（2026-10-03）**：原先记录的「端口被孤儿进程占用」**阻塞已解除**，
-> 且**原诊断有误，本节已按实测更正**。真实授权联调本身**仍未做**（需人工点一次）。
+本机 `:3000` 属 **Forgejo**（`forgejo.service`，uid 115，systemd 开机自启），
+**与 Boxli 前端无关**。因此：
 
-**❌ 原记录的错误诊断**
+- **前端不能用 3000**，改用 **3011** 或 **3077**（`:3001` 属 docker-proxy）
+- `hub.toml` 的 **`[site] frontend_url` 必须与前端实际端口一致**
 
-原文称：`127.0.0.1:3727` 与 `localhost:3000` 被**孤儿进程**占用（属主在 PID 命名空间不可见、
-无法 kill），且跑的是陈旧配置/构建。
-
-**实测结论：这两条都不成立。**
-
-| 端口 | 原记录 | ✅ 实测真相 |
-|---|---|---|
-| `127.0.0.1:3727`（及 `:3740`、`:3750`） | 孤儿进程，无法清理 | **不是孤儿**：是 **5 组重复的 `go run ./cmd/hub`**（父进程 + `hub` 子进程共 10 个），属主 `uid=1001` **清晰可见**，`kill` 完全可用 |
-| `localhost:3000` | 陈旧的前端构建（`/login` `/submit` `/dashboard` 均 404） | **根本不是 Boxli 前端**：该端口属 **Forgejo**（`forgejo.service`，`uid:115`，systemd `enabled` + `active`，长期占用）。那 404 是 **Forgejo 的响应** |
-
-**为什么会被误判成「孤儿 socket」**
-
-`ss -ltnp` 对**其他用户**持有的 socket **不会解析出 PID**，于是输出里没有 `users:(...)`。
-原记录把「看不到属主」直接推断为「属主不可见 / 孤儿 socket」，这是**错误推断** ——
-真相是「属主是别的用户，当前用户无权解析」。
-
-正确判据是 `ss -ltnpe`，读 **`uid:` 与 `cgroup:`** 字段：
-
-```bash
-ss -ltnpe | grep -E ':(3000|3727|3740|3750)\b'
-# *:3000           uid:115   cgroup:/system.slice/forgejo.service  ← 系统服务 Forgejo，与项目无关
-# 127.0.0.1:3727   uid:1001  users:(("hub",pid=937975,fd=6))       ← 本项目后端，属主可见
-```
-
-**已执行的清理（2026-10-03）**
-
-```bash
-pkill -f 'go run ./cmd/hub'      # 5 组重复实例（父 + 子共 10 个进程）
-```
-
-- 10 个进程全部 **SIGTERM 干净退出**（无需 SIGKILL），`:3727` / `:3740` / `:3750` **已释放**
-- **PostgreSQL 保留**（`:5432`，项目依赖），数据基线未变：`5 users / 5 repos / 10 tags / 17 sources`
-- **`:3000` 未动** —— 那是 Forgejo 系统服务，**不属于本项目，不得清理**
-
-**⚠️ 由此产生的必须修正项：前端端口与 `[site] frontend_url`**
-
-既然 `:3000` 长期被 Forgejo 占用，**Boxli 前端在本机不能使用 3000**。
-而 `[site] frontend_url` 的默认值曾是 `http://localhost:3000`。这会导致两个真实故障：
+该字段身兼两职，写错会同时坏两件事：
 
 | 故障 | 原因 |
 |---|---|
-| OAuth 成功后 **302 落到 Forgejo** 而非本站 | `[site] frontend_url` 即回跳目标站点 |
-| 真实前端的**写请求被 403 拒绝** | 同一字段也是 `OriginGuard` 的 CSRF 来源白名单，白名单里是 Forgejo 的 origin |
-
-**解除方式**（前端换端口，后端指向同一端口）：`hub.toml` 的默认值现已改为
-`http://localhost:3011`，只需确认与前端实际端口一致：
+| OAuth 成功后 **302 落到 Forgejo** 而非本站 | `[site] frontend_url` 即 302 回跳目标 |
+| 真实前端的**写请求被 403 拒绝** | 同一字段也是 `OriginGuard` 的 CSRF 来源白名单 |
 
 ```toml
 [site]
 frontend_url = "http://localhost:3011"
 ```
 
+**排查端口归属时用 `ss -ltnpe`**，读 `uid:` 与 `cgroup:` 字段：
+
 ```bash
-cd backend && go run ./cmd/hub
-cd frontend && PORT=3011 node .output/server/index.mjs
+ss -ltnpe | grep -E ':(3000|3727)\b'
+# *:3000           uid:115   cgroup:/system.slice/forgejo.service  ← Forgejo，不得清理
+# 127.0.0.1:3727   uid:1001  users:(("hub",pid=937975,fd=6))       ← 本项目后端
 ```
 
-随后访问 `http://localhost:3011/login` 完成一次授权，即可补齐端到端验证。
+> **⚠️ `ss -ltnp` 会误导**：它对**其他用户**持有的 socket 不解析 PID，输出里没有
+> `users:(...)`。曾据此误判 Forgejo 占用的 3000 为「本项目的孤儿 socket」——
+> 实际是「属主是别的用户，当前用户无权解析」。**判定归属必须看 `uid:`/`cgroup:`**。
 
-> **GitHub App 登记无需改动**：回调仍是 `http://127.0.0.1:3727/api/v1/auth/callback`（后端承接），
-> 变的只是前端端口与 `[site] frontend_url`。
->
-> 空闲可用端口参考：**3011**、**3077**（`:3000` 属 Forgejo，`:3001` 属 docker-proxy）。
-
-> 该阻塞**不影响代码正确性**：Cookie 会话、302 回跳、CSRF、state 一次性消费、
+> 该约束**不影响代码正确性**：Cookie 会话、302 回跳、CSRF、state 一次性消费、
 > 完整 CRUD 与权限校验均已 curl 逐项实测通过（见 [9.2](#92-已实测的行为curl2026-10-02)）。
 
-### 11.2 阶段 5：文档站 `/docs` ✅ 已完成（2026-10-02）
+### 11.2 文档站 `/docs`（已完成）
 
 - [x] 文档路由与侧边导航（桌面 sticky + 手机折叠目录 + 本页小节锚点 + 上下页翻页）
 - [x] 快速开始、安装、`pull`/`run` 命令、镜像格式说明、FAQ（共 7 个页面）
 - [x] 手机端阅读体验（折叠目录、横向滚动 chip/表格/代码块、16px 正文）
 - [x] 标题锚点深链（`slugify` + `heading_open`，`anchors` 选项控制，README 行为不变）
 
-实现细节见 [6.8 文档站（阶段 5）](#68-文档站阶段-5)。
+实现细节见 [6.8 文档站](#68-文档站)。
 
 **验证**：7 个路由全部 200；51 条内部链接与跨页深链逐条校验通过；
 `eslint` 0 error / 0 warning；`nuxt build` 成功。
 
 > **⚠️ 手机端仍为静态断言**（viewport、`100dvh`、`overflow-x-hidden`、44px 触控、
 > 16px 输入框、无 hover-only），**未做真实浏览器/真机测试**，
-> 与阶段 3/4 一致，真实验收属 [11.3](#113-阶段-6手机端全面验收)。
+> 真实验收属 [11.3](#113-手机端验收待做)。
 
 > **⚠️ 内容准确性**：命令与 flag 抄录自真实 `boxli` 二进制（`0.0.0-dev`，实际 28 个子命令），
 > 镜像引用为 `NAME:VERSION`（无命名空间段），`pull` 为双语义。
@@ -872,13 +845,16 @@ cd frontend && PORT=3011 node .output/server/index.mjs
 > 与本站 `/api/v1/*` 并非同一实现 —— 已在 `/docs/faq` 首节如实标注，
 > 且不提供无法执行的示例。**CLI 与本站 Hub 的对接为后续工作项。**
 
-### 11.3 阶段 6：手机端全面验收
+### 11.3 手机端验收（待做）
 
 需重新准备浏览器环境（或真机 / BrowserStack），补齐 [9.3](#93-尚未验证的部分不得视为已验收) 全部项。
 
-### 11.4 阶段 7：部署上线
+### 11.4 部署上线（待做）
 
-- Nginx：前端托管 + `/api/` 反代 + `/docs/`
+> 完整步骤见 [`DEPLOYMENT.md`](./DEPLOYMENT.md)，此处仅列要点。
+
+- Nginx：前端 SSR 反代 + `/api/` 反代
+  （**注意：`/docs` 就是 Nuxt 路由，没有独立的静态目录**）
 - Let's Encrypt HTTPS
 - systemd：`boxli-hub.service` + 前端服务
 - **`[session] cookie_secure = true`**（生产 HTTPS 必须；配 `http://` 会拒绝启动）
