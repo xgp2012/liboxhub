@@ -43,6 +43,19 @@ jobs:
           go-version: '1.27'
           cache-dependency-path: backend/go.sum
 
+      # ⚠️ 这一步是必需的，不是冗余。
+      # internal/web/web.go 用 `//go:embed all:dist` 内嵌前端产物，而 dist/ 被
+      # gitignore（属构建产物）。go:embed 在**编译期**解析路径，因此只要包被编译
+      # （go vet / go test / go build 都一样），dist/ 就必须存在，否则报：
+      #     pattern all:dist: no matching files found
+      # 这里放一个占位文件让它能编译通过；真实的嵌入完整性由 build job
+      # 构建完前端后的 TestEmbedContainsNuxtAssets 验证。
+      - name: Stub embedded assets (placeholder for go:embed)
+        run: |
+          mkdir -p backend/internal/web/dist/public
+          echo 'placeholder: real assets are generated in the build job' \
+            > backend/internal/web/dist/public/.gitkeep
+
       - name: go vet
         working-directory: backend
         run: go vet ./...
@@ -51,7 +64,11 @@ jobs:
         working-directory: backend
         # 部分测试需要数据库；连不上会自动 skip（见 DEVELOPMENT.md），
         # 因此这里不配置 PostgreSQL 也能跑通核心用例。
-        run: go test ./... -v
+        #
+        # 注意：此处 dist/ 是占位内容，所以 TestEmbedContainsNuxtAssets 与
+        # TestSSRBundleEmbedded 会失败——用 -skip 排除它们，
+        # 这两个测试在 build job 里（真实产物就绪后）才跑。
+        run: go test ./... -v -skip 'TestEmbedContainsNuxtAssets|TestSSRBundleEmbedded'
 
   # ---------------------------------------------------------------------------
   # 构建：先前端（Nuxt + esbuild 打包），再后端（内嵌前端产物）
