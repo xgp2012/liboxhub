@@ -63,7 +63,8 @@
 
       <p v-if="loginUnavailable" class="mt-3 text-xs leading-relaxed text-amber-400/90">
         后端未配置 OAuth 凭证（或未开启本地模拟登录），当前无法登录。
-        请检查 <code class="text-zinc-400">BOXLI_GITHUB_CLIENT_ID/SECRET</code>。
+        请检查 <code class="text-zinc-400">hub.toml</code> 里的
+        <code class="text-zinc-400">[github] client_id / secret</code>。
       </p>
     </div>
 

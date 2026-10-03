@@ -14,12 +14,14 @@ backend/data/
 # 体积约 370MB，且含本地数据库数据，不进仓库
 .devtools/
 
-# ---- 环境变量：含密钥，禁止提交 ----
+# ---- 配置文件：含密钥，禁止提交 ----
 .env
 .env.local
 *.local
+backend/hub.toml
 # 示例文件需要保留
 !.env.example
+!backend/hub.toml.example
 
 # ---- 日志 ----
 *.log

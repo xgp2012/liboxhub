@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,7 +18,16 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	configPath := flag.String("config", config.DefaultPath,
+		"TOML 配置文件路径")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "boxli-hub: %v\n", err)
+		os.Exit(1)
+	}
+	log.Printf("loaded %s", cfg)
 
 	pool, err := db.Pool(context.Background(), cfg.DBURL)
 	if err != nil {

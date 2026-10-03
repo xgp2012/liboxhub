@@ -38,15 +38,16 @@ ExecStart=/usr/local/bin/boxli hub serve \
     --db "postgres://..."
 ```
 
-**这三样东西在代码里全都不存在**，照抄会静默出错（不会报错，但参数全部无效）：
+**这些写法在代码里全都不成立**（本文档已按 2026-10-03 改造后的实际代码重写）：
 
 | 文档写法 | 实际情况 | 核查证据 |
 |---|---|---|
-| `boxli hub serve` 子命令 | 二进制**不解析任何命令行参数** | 全仓库 `grep 'flag\.\|os.Args\|cobra'` 返回空；实测 `./boxli-hub --bogus-flag-xyz` 照常启动，参数被静默忽略 |
-| `--addr` / `--data-dir` / `--db` | 不存在。配置**只能走环境变量** | 见 `backend/internal/config/config.go` 的 `Load()`，全部读 `os.Getenv` |
-| `--data-dir /var/lib/boxli/hub` | `DataDir` 是**死代码** | 该字段仅在 `config.go:43` 被赋值，**全仓库无任何地方读取** |
+| `boxli hub serve` 子命令 | 不存在。二进制**只解析一个参数 `--config`** | `cmd/hub/main.go` 仅注册 `flag.String("config", ...)`；实测 `--help` 只列出 `-config` |
+| `--addr` / `--data-dir` / `--db` | 不存在。配置**全部来自 TOML 文件** | 见 `backend/internal/config/config.go` 的 `Load()`，不读任何环境变量 |
+| `--data-dir /var/lib/boxli/hub` | `DataDir` 是**死代码**，且未迁移到 TOML | 该字段全仓库无任何地方读取，故配置里不再暴露 |
 
-**✅ 正确做法**：`ExecStart` 只写二进制路径，其余全部通过 `EnvironmentFile` 注入（见[第四节](#四后端-systemd)）。
+**✅ 正确做法**：`ExecStart=/usr/local/bin/boxli-hub --config /etc/boxli-hub/hub.toml`，
+配置写在该 TOML 文件里（见[第四节](#四后端-systemd)）。
 
 > ⚠️ `/usr/local/bin/boxli` 是**另一个程序**，不是本项目。`DEVELOPMENT.md:504` 自己承认：
 > 本机 `boxli` CLI 对接的是「另一套 Hub（`boxli hub serve`：用户名/密码 + blob 存储）」。
@@ -62,7 +63,7 @@ ExecStart=/usr/local/bin/boxli hub serve \
 
 **✅ 正确做法**：用 `npm run build`（preset = `node-server`），跑 `node .output/server/index.mjs`。
 
-### 坑 3：`BOXLI_FRONTEND_URL` 身兼两职，设错会同时坏两件事
+### 坑 3：`[site] frontend_url` 身兼两职，设错会同时坏两件事
 
 它**既是** OAuth 成功后的 302 回跳落点，**又是**写接口的 CSRF 来源白名单
 （`config.go` 的 `AllowedOrigins()`）。生产环境必须是 `https://boxli.dev`。
@@ -110,7 +111,7 @@ POST 带 Origin: http://evil.com        -> 403（CSRF 拦截）             ✅
 | 5432 | PostgreSQL | ❌ 仅回环 |
 
 > **⚠️ 本开发机特例**：本机 `:3000` 已被 **Forgejo**（`forgejo.service`，uid 115）长期占用。
-> 因此在**本机**做部署演练时，前端端口必须换成 **3011** 或 **3077**，并同步改 `BOXLI_FRONTEND_URL`。
+> 因此在**本机**做部署演练时，前端端口必须换成 **3011** 或 **3077**，并同步改 `hub.toml` 的 `[site] frontend_url`。
 > 生产服务器若无此冲突，用 3000 即可。
 
 ---
@@ -180,8 +181,8 @@ openssl rand -base64 24
 
 ```bash
 cd backend
-BOXLI_DB="postgres://boxli:<密码>@127.0.0.1:5432/boxli_hub?sslmode=disable" \
-  go run ./cmd/seed
+# 连接串取自 hub.toml 的 [db] url；也可用 --config 指向生产配置
+go run ./cmd/seed --config /etc/boxli-hub/hub.toml
 ```
 
 种子内容：5 个示例镜像 / 10 个标签 / 17 个下载源。
@@ -201,47 +202,55 @@ sudo chown boxli:boxli /var/lib/boxli
 
 > 命名用 **`boxli-hub`** 而非 `boxli`，避免与既有 boxli CLI 冲突（见[坑 1](#坑-1plantsmd-里的-systemd-execstart-是错的)）。
 
-### 4.2 环境变量文件
+### 4.2 配置文件
 
-`/etc/boxli-hub.env`：
+`/etc/boxli-hub/hub.toml`：
 
-```bash
+```toml
 # ---- 监听与数据库 ----
-BOXLI_ADDR=127.0.0.1:3727
-BOXLI_DB=postgres://boxli:<强随机密码>@127.0.0.1:5432/boxli_hub?sslmode=disable
+[server]
+addr = "127.0.0.1:3727"
 
-# ---- 会话签名（必填，否则认证接口 503）----
+[db]
+url = "postgres://boxli:<强随机密码>@127.0.0.1:5432/boxli_hub?sslmode=disable"
+
+# ---- 会话（jwt_secret 必填，否则认证接口 503）----
+[session]
 # 生成：openssl rand -hex 32
-BOXLI_JWT_SECRET=<64位十六进制>
+jwt_secret = "<64位十六进制>"
+ttl_hours = 720
+# ---- 生产 HTTPS 必须为 true ----
+cookie_secure = true
 
 # ---- GitHub OAuth（上线前必须重新生成 Secret！见第七节）----
-BOXLI_GITHUB_CLIENT_ID=<新的 Client ID>
-BOXLI_GITHUB_SECRET=<新的 40 位十六进制 Secret>
-BOXLI_GITHUB_REDIRECT=https://boxli.dev/api/v1/auth/callback
+[github]
+client_id = "<新的 Client ID>"
+secret = "<新的 40 位十六进制 Secret>"
+redirect = "https://boxli.dev/api/v1/auth/callback"
 
 # ---- 回跳落点 + CSRF 白名单（两者共用，必须是生产域名）----
-BOXLI_FRONTEND_URL=https://boxli.dev
+[site]
+frontend_url = "https://boxli.dev"
 
-# ---- 生产 HTTPS 必须为 true ----
-BOXLI_COOKIE_SECURE=true
-
-# ---- 会话有效期（小时），默认 720 = 30 天 ----
-BOXLI_SESSION_TTL_HOURS=720
-
-# ---- 生产必须保持关闭 ----
-BOXLI_DEV_LOGIN=0
+# ---- 生产必须保持关闭（设为 true 时程序直接拒绝启动）----
+[dev]
+enabled = false
 ```
 
 权限：
 
 ```bash
-sudo chown root:root /etc/boxli-hub.env
-sudo chmod 600 /etc/boxli-hub.env
+sudo mkdir -p /etc/boxli-hub
+sudo chown root:root /etc/boxli-hub/hub.toml
+sudo chmod 600 /etc/boxli-hub/hub.toml
 ```
 
-> **为什么 `BOXLI_COOKIE_SECURE=true` 是硬要求**：会话 Cookie 承载 JWT（`cookie.go`）。
+> 完整字段说明见 `backend/hub.toml.example`（含逐项注释）。
+
+> **为什么 `cookie_secure = true` 是硬要求**：会话 Cookie 承载 JWT（`cookie.go`）。
 > 生产 HTTPS 下设 `false`，Cookie 会在明文信道传输；本地 `http://localhost` 下设 `true`，
 > 浏览器会**直接丢弃** Cookie，症状是「登录看似成功但始终显示未登录」。
+> 两者不匹配时**程序会在启动阶段直接报错退出**，不会带病运行。
 
 ### 4.3 unit 文件
 
@@ -258,9 +267,9 @@ Wants=postgresql.service
 Type=simple
 User=boxli
 Group=boxli
-EnvironmentFile=/etc/boxli-hub.env
-# ⚠️ 不要在这里加 --addr/--db/--data-dir，二进制不解析参数（见坑 1）
-ExecStart=/usr/local/bin/boxli-hub
+# ⚠️ 不要在这里加 --addr/--db/--data-dir，二进制不解析这些参数（见坑 1）
+# 唯一支持的是 --config，用于指定 TOML 配置文件路径
+ExecStart=/usr/local/bin/boxli-hub --config /etc/boxli-hub/hub.toml
 Restart=always
 RestartSec=5
 
@@ -284,9 +293,10 @@ sudo systemctl status boxli-hub
 sudo journalctl -u boxli-hub -n 50 --no-pager
 ```
 
-**成功日志应包含两行**：
+**成功日志应包含三行**：
 
 ```
+loaded config{path=/etc/boxli-hub/hub.toml addr=127.0.0.1:3727 db=postgres://boxli:***@127.0.0.1:5432/boxli_hub?sslmode=disable frontend=https://boxli.dev cookie_secure=true ttl=720h oauth=true dev_login=false}
 database migrated
 boxli hub listening on 127.0.0.1:3727
 ```
@@ -469,12 +479,12 @@ sudo ufw status verbose
 
 | 优先级 | 项 | 原因 |
 |---|---|---|
-| 🔴 **必做** | **重新生成 `BOXLI_GITHUB_SECRET`** | 当前值已在开发过程中明文外泄（进入过对话/文件）。到 GitHub → Settings → Developer settings → OAuth Apps → 该应用 → **Regenerate client secret** |
-| 🔴 **必做** | 更新 GitHub App 的 **Authorization callback URL** 为 `https://boxli.dev/api/v1/auth/callback` | `github.go` 的 `Exchange()` 会把配置里的 `BOXLI_GITHUB_REDIRECT` 作为 `redirect_uri` 发给 GitHub，与登记值不一致会返回 `redirect_uri_mismatch` |
-| 🔴 **必做** | `BOXLI_COOKIE_SECURE=true` | 见[4.2](#42-环境变量文件) |
-| 🔴 **必做** | `BOXLI_DEV_LOGIN=0` | 开启后 `POST /auth/login` 传 `{"github_user":"x"}` 即可**登录为任意账号** |
-| 🔴 **必做** | `BOXLI_JWT_SECRET` 用 `openssl rand -hex 32` 生成，**不要复用开发值** | 复用开发密钥等于把开发环境的会话迁移到生产 |
-| 🟡 建议 | `BOXLI_FRONTEND_URL=https://boxli.dev` | 回跳落点 + CSRF 白名单双职责 |
+| 🔴 **必做** | **重新生成 `[github] secret`** | 当前值已在开发过程中明文外泄（进入过对话/文件）。到 GitHub → Settings → Developer settings → OAuth Apps → 该应用 → **Regenerate client secret** |
+| 🔴 **必做** | 更新 GitHub App 的 **Authorization callback URL** 为 `https://boxli.dev/api/v1/auth/callback` | `github.go` 的 `Exchange()` 会把配置里的 `[github] redirect` 作为 `redirect_uri` 发给 GitHub，与登记值不一致会返回 `redirect_uri_mismatch` |
+| 🔴 **必做** | `[session] cookie_secure = true` | 见[4.2](#42-配置文件)；配 `http://` 时程序会拒绝启动 |
+| 🔴 **必做** | `[dev] enabled = false` | 开启后 `POST /auth/login` 传 `{"github_user":"x"}` 即可**登录为任意账号**；设为 true 时程序会拒绝启动 |
+| 🔴 **必做** | `[session] jwt_secret` 用 `openssl rand -hex 32` 生成，**不要复用开发值** | 复用开发密钥等于把开发环境的会话迁移到生产 |
+| 🟡 建议 | `[site] frontend_url = "https://boxli.dev"` | 回跳落点 + CSRF 白名单双职责 |
 | 🟡 建议 | 前端显式 `HOST=127.0.0.1` | 见[5.2](#52-unit-文件) |
 | 🟡 建议 | Nginx 传递 `X-Forwarded-Proto` | 便于后续判断协议 |
 
@@ -522,10 +532,10 @@ curl -s -o /dev/null -w "%{http_code}\n" https://boxli.dev/docs      # 200
 2. 点登录 → 应跳转到 **GitHub 授权页**（若报 `redirect_uri_mismatch`，说明第 7 节的 callback URL 没同步）
 3. 授权后应回到 `https://boxli.dev/dashboard`，且**显示已登录**
 4. 打开 DevTools → Application → Cookies，确认 `boxli_session` 存在且带 **`HttpOnly` + `Secure`** 标记
-5. 在 `/submit` 提交一个测试仓库，确认**写请求不被 403**（403 = `BOXLI_FRONTEND_URL` 配错）
+5. 在 `/submit` 提交一个测试仓库，确认**写请求不被 403**（403 = `[site] frontend_url` 配错）
 
-> **第 3 步失败但第 2 步成功**，通常是 `BOXLI_COOKIE_SECURE` 与协议不匹配，
-> 或 `BOXLI_FRONTEND_URL` 域名与实际访问域名不一致（含 `www.` 前缀差异）。
+> **第 3 步失败但第 2 步成功**，通常是 `[session] cookie_secure` 与协议不匹配，
+> 或 `[site] frontend_url` 域名与实际访问域名不一致（含 `www.` 前缀差异）。
 
 ### 8.5 CSRF 防线仍生效
 
@@ -643,19 +653,26 @@ export npm_config_cache=/home/xgp2012/hub/.devtools/npmcache
 npm run build
 ```
 
-### 10.3 启动后端（用 `.env` 注入，不要用命令行参数）
+### 10.3 启动后端（用 TOML 配置文件，不要用命令行参数）
 
 ```bash
 cd /home/xgp2012/hub/backend
-set -a; . ./.env; set +a
-export BOXLI_FRONTEND_URL=http://127.0.0.1:3011   # ⚠️ 必须覆盖，.env 里没有这一项
-export BOXLI_COOKIE_SECURE=false                  # 本机是 http
-nohup ./boxli-hub > /home/xgp2012/hub/hub.log 2>&1 &
+# 本机演练：确认 hub.toml 里 frontend_url 与实际前端端口一致
+nohup ./boxli-hub --config ./hub.toml > /home/xgp2012/hub/hub.log 2>&1 &
 ```
 
-> **`.env` 里没有 `BOXLI_FRONTEND_URL`**，不显式覆盖会落到代码默认值
-> `http://localhost:3000` —— 而本机 3000 是 **Forgejo**。
-> 后果是 OAuth 回跳落到 Forgejo，且所有写请求被 CSRF 白名单 403 拒绝。
+`hub.toml` 关键项（本机演练用）：
+
+```toml
+[site]
+frontend_url = "http://127.0.0.1:3011"   # ⚠️ 必须与前端实际端口一致
+
+[session]
+cookie_secure = false                     # 本机是 http
+```
+
+> **`frontend_url` 必须显式对上前端端口**：本机 3000 是 **Forgejo**，
+> 若该值指向 3000，OAuth 回跳会落到 Forgejo，且所有写请求被 CSRF 白名单 403 拒绝。
 
 ### 10.4 启动前端
 
@@ -709,14 +726,14 @@ ss -ltnpe | grep -E ':(3000|3011|3727|5432)\b'
 
 | 症状 | 原因 | 处理 |
 |---|---|---|
-| 登录后仍显示未登录 | `BOXLI_COOKIE_SECURE=true` 但走的是 http；或域名不一致 | 本地设 `false`，生产设 `true`，协议与域名必须匹配 |
-| OAuth 回跳跳到别的站点 | `BOXLI_FRONTEND_URL` 没改 | 设成实际前端地址（本机 `http://127.0.0.1:3011`） |
-| 写请求 403 `cross-site request blocked` | 同上，CSRF 白名单未含实际来源 | 同上；多域名用 `BOXLI_EXTRA_ORIGINS` |
-| 登录报 `redirect_uri_mismatch` | GitHub App 登记值与 `BOXLI_GITHUB_REDIRECT` 不一致 | 两处改成完全相同 |
-| `/auth/login` 返回 503 | `BOXLI_JWT_SECRET` 未设，或 OAuth 未配且 `BOXLI_DEV_LOGIN=0` | 正确行为。设密钥 / 配 OAuth |
+| 登录后仍显示未登录 | `[session] cookie_secure = true` 但走的是 http；或域名不一致 | 本地设 `false`，生产设 `true`，协议与域名必须匹配（不匹配时启动即报错） |
+| OAuth 回跳跳到别的站点 | `[site] frontend_url` 没改 | 设成实际前端地址（本机 `http://127.0.0.1:3011`） |
+| 写请求 403 `cross-site request blocked` | 同上，CSRF 白名单未含实际来源 | 同上；多域名用 `[site] extra_origins` |
+| 登录报 `redirect_uri_mismatch` | GitHub App 登记值与 `[github] redirect` 不一致 | 两处改成完全相同 |
+| `/auth/login` 返回 503 | `[session] jwt_secret` 未设，或 OAuth 未配且 `[dev] enabled = false` | 正确行为。设密钥 / 配 OAuth |
 | dev 登录返回 409 | 该 `github_user` 已被占用（L7 账号接管防护） | 换一个未占用的用户名 |
 | 前端页面取不到数据，后端日志无请求 | SSR 取数失败，或 `HOST` 绑错 | 先 `curl 127.0.0.1:3727/api/v1/health` 验证后端 |
-| 改了 systemd 的 `--addr` 但端口没变 | 二进制不解析参数（坑 1） | 改用 `EnvironmentFile` 里的 `BOXLI_ADDR` |
+| 改了 systemd 的 `--addr` 但端口没变 | 二进制不解析该参数（坑 1） | 改 `hub.toml` 的 `[server] addr` |
 
 ### 11.3 日志
 
@@ -739,7 +756,7 @@ sudo tail -f /var/log/nginx/error.log
 | **health 不探数据库** | `handleHealth` 恒返 `healthy` | 数据库挂了监控不会告警，需用 `/api/v1/repos` 替代探活 |
 | **无备份脚本** | 见[第九节](#九备份与恢复)自建 | 数据丢失无兜底 |
 | **无 CI/CD** | 仓库无任何 workflow / Makefile / Dockerfile | 构建与部署全手工 |
-| **`BOXLI_DATA_DIR` 是死代码** | 配置项存在但无任何读取处 | 无需设置；若未来接入 blob 存储需重新实现 |
+| **数据目录（原 `BOXLI_DATA_DIR`）** | 该字段为死代码，改造 TOML 时未迁移 | 无需设置；若未来接入 blob 存储需重新实现 |
 | **阶段 6 手机端验收未完成** | Lighthouse Mobile、真机触控、iOS `100dvh` 等未实测 | 移动端体验未验收 |
 
 ---
@@ -748,7 +765,7 @@ sudo tail -f /var/log/nginx/error.log
 
 | 事项 | `plants.md` 原写法 | ✅ 正确做法 |
 |---|---|---|
-| 后端启动 | `boxli hub serve --addr ... --db ...` | `ExecStart=/usr/local/bin/boxli-hub` + `EnvironmentFile` |
+| 后端启动 | `boxli hub serve --addr ... --db ...` | `ExecStart=/usr/local/bin/boxli-hub --config /etc/boxli-hub/hub.toml` |
 | 前端形态 | 方式一 SSR / 方式二 SSG 二选一 | **只能 SSR**（`routeRules` 代理 + SSR 取数） |
 | 前端托管 | `root` + `try_files` 静态 | `proxy_pass http://127.0.0.1:3000` |
 | `/docs/` | 独立静态目录 `/var/www/boxli/docs` | 删除，随 Nuxt `/docs` 路由提供 |

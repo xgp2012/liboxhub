@@ -7,5 +7,5 @@
 # logs
 *.log
 
-# env
-.env
+# config：本地配置含密钥，禁止提交（示例 hub.toml.example 保留）
+/hub.toml

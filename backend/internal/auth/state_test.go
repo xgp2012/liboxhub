@@ -3,21 +3,24 @@ package auth
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/LiStudioorg/boxli/internal/config"
 )
 
-// testPool 连接开发库；未设置 BOXLI_TEST_DB 时跳过（保证 CI/无库环境不失败）。
+// testPool 用 backend/hub.toml 里的 db.url 连接开发库；连不上则跳过
+// （保证 CI / 无库环境下测试不会失败）。
+// 需要指向别的库时改 hub.toml 的 [db].url。
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := os.Getenv("BOXLI_TEST_DB")
-	if dsn == "" {
-		dsn = "postgres://boxli:boxli@127.0.0.1:5432/boxli_hub?sslmode=disable"
+	cfg, err := config.Load("../../hub.toml")
+	if err != nil {
+		t.Skipf("no config: %v", err)
 	}
-	pool, err := pgxpool.New(context.Background(), dsn)
+	pool, err := pgxpool.New(context.Background(), cfg.DBURL)
 	if err != nil {
 		t.Skipf("no test database: %v", err)
 	}

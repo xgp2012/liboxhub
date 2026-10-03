@@ -67,7 +67,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.auth.Enabled() {
-		writeErr(w, http.StatusServiceUnavailable, "auth not configured: set BOXLI_JWT_SECRET")
+		writeErr(w, http.StatusServiceUnavailable, "auth not configured: set session.jwt_secret in hub.toml")
 		return
 	}
 
@@ -94,10 +94,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// dev 模拟登录：必须显式开启 BOXLI_DEV_LOGIN=1，默认关闭（生产禁止）。
+	// dev 模拟登录：必须在 hub.toml 里显式设置 [dev].enabled = true，默认关闭。
 	if !s.cfg.DevLogin {
 		writeErr(w, http.StatusServiceUnavailable,
-			"oauth not configured; dev login is disabled (set BOXLI_DEV_LOGIN=1 for local development)")
+			"oauth not configured; dev login is disabled (set [dev].enabled = true in hub.toml for local development)")
 		return
 	}
 

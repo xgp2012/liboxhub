@@ -81,7 +81,8 @@ internal/
 │   ├── state.go             # OAuth state 一次性校验（DELETE ... RETURNING）
 │   ├── state_test.go        # state 单次消费 / 伪造 / 过期
 │   └── origin_test.go       # 【阶段 4】来源校验 + Cookie 属性测试
-├── config/config.go         # 环境变量配置（含阶段 4 新增 5 项）
+├── config/config.go         # TOML 配置加载 + 启动期校验（hub.toml）
+├── config/config_test.go    # 默认值/未知键/校验/脱敏 断言
 ├── db/
 │   ├── db.go                # pgxpool 连接池 + go:embed 迁移执行器
 │   └── migrations/
@@ -286,7 +287,7 @@ http.SetCookie(w, &http.Cookie{
    └─ ④ 拉取 GitHub 用户信息
    └─ ⑤ upsert 用户（冲突 → 409 语义）
    └─ ⑥ 签发会话 → Set-Cookie
-   └─ ⑦ 302 到 BOXLI_FRONTEND_URL + redirect（站内路径）
+   └─ ⑦ 302 到 [site] frontend_url + redirect（站内路径）
 ⑤ 前端页面 → GET /auth/me（自动带 Cookie）→ 显示已登录
 ```
 
@@ -364,7 +365,7 @@ if origin != "" && auth.OriginAllowed(origin, allowed) {
 
 ### 5.8 dev 模拟登录（默认关闭）
 
-`BOXLI_DEV_LOGIN=1` 且未配 OAuth 凭证时，`POST /auth/login {"github_user":"x"}` 直接下发会话。
+`[dev] enabled = true` 且未配 OAuth 凭证时，`POST /auth/login {"github_user":"x"}` 直接下发会话。
 **默认关闭**——开启后任何人可登录为任意账号。
 
 > 注意：dev 登录每次生成**随机 `github_id`**，若用户名已存在会触发 L7 的 409 防护。
@@ -526,7 +527,7 @@ function commit(next: SourceRow[]) {
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/auth/login` | 有 OAuth 凭证返回 `authorize_url`；否则需 `BOXLI_DEV_LOGIN=1` 才模拟登录 |
+| POST | `/auth/login` | 有 OAuth 凭证返回 `authorize_url`；否则需 `[dev] enabled = true` 才模拟登录 |
 | GET | `/auth/callback?code=&state=` | 校验并消费 state → 换 token → **302 回前端** + Set-Cookie |
 | GET | `/auth/me` | 当前用户（Cookie 或 Bearer） |
 | POST | `/auth/logout` | 吊销 session + 清 Cookie |
@@ -573,7 +574,7 @@ function commit(next: SourceRow[]) {
 | 403 | 非 owner / **跨站来源被 CSRF 拦截** |
 | 404 | 仓库不存在 |
 | 409 | 仓库已存在 / 用户名被占用 |
-| 503 | 未配 `BOXLI_JWT_SECRET`；或未配 OAuth 且未开 dev 登录 |
+| 503 | 未配 `[session] jwt_secret`；或未配 OAuth 且未开 dev 登录 |
 
 ---
 
@@ -586,8 +587,9 @@ cd backend
 export GOCACHE=/home/xgp2012/hub/.devtools/gocache \
        GOMODCACHE=/home/xgp2012/hub/.devtools/gomodcache \
        GOPATH=/home/xgp2012/hub/.devtools/gopath
-# 复制 .env.example 为 .env 并按需修改
-go run ./cmd/hub     # 启动时自动迁移；监听 127.0.0.1:3727
+# 首次：复制 hub.toml.example 为 hub.toml 并按需修改
+cp hub.toml.example hub.toml
+go run ./cmd/hub     # 启动时自动迁移；监听 127.0.0.1:3727（可加 --config 指定文件）
 go run ./cmd/seed    # 种子数据（幂等）
 ```
 
@@ -596,7 +598,7 @@ go run ./cmd/seed    # 种子数据（幂等）
 ### 8.2 前端
 
 > **⚠️ 本机不能用 3000 端口** —— 3000 属 **Forgejo**（`forgejo.service`，uid 115，开机自启），
-> 与 Boxli 前端无关。必须换端口（如 3011），并**同步设置 `BOXLI_FRONTEND_URL`**，
+> 与 Boxli 前端无关。必须换端口（如 3011），并**同步修改 `hub.toml` 的 `[site] frontend_url`**，
 > 否则 OAuth 回跳落错站点、写请求被 CSRF 拦截（403）。见 [11.1](#111-阶段-4-阻塞项已解除)。
 
 ```bash
@@ -623,7 +625,7 @@ PORT=3011 node .output/server/index.mjs             # 生产预览（端口任�
 ### 8.3 用 curl 调试认证（走 Bearer，无需处理 Cookie）
 
 ```bash
-# 1. 登录拿 token（dev 模式，需 BOXLI_DEV_LOGIN=1 且未配 OAuth）
+# 1. 登录拿 token（dev 模式，需 [dev] enabled = true 且未配 OAuth）
 TOKEN=$(curl -s -X POST http://127.0.0.1:3727/api/v1/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"github_user":"localdev"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["token"])')
@@ -641,7 +643,7 @@ curl -s -X POST http://127.0.0.1:3727/api/v1/repos \
 ### 8.4 用 curl 调试 Cookie 会话（模拟浏览器）
 
 ```bash
-# Origin 必须是后端白名单里的前端站点（即 BOXLI_FRONTEND_URL，本机示例 3011）
+# Origin 必须是后端白名单里的前端站点（即 [site] frontend_url，本机示例 3011）
 curl -s -c cookies.txt -X POST http://127.0.0.1:3727/api/v1/auth/login \
   -H 'Origin: http://localhost:3011' -H 'Content-Type: application/json' \
   -d '{"github_user":"localdev"}'
@@ -653,14 +655,14 @@ curl -s -b cookies.txt http://127.0.0.1:3727/api/v1/auth/me
 
 | 症状 | 原因 / 处理 |
 |---|---|
-| 登录后仍显示未登录 | `BOXLI_COOKIE_SECURE=true` 却在 `http://localhost` 下访问 → 浏览器丢弃 Cookie；本地应设 `false` |
+| 登录后仍显示未登录 | `[session] cookie_secure = true` 却在 `http://localhost` 下访问 → 浏览器丢弃 Cookie；本地应设 `false`（配置不匹配时启动即报错） |
 | 写请求 401 | 前端漏了 `credentials: 'include'` → 统一走 `apiWrite()` |
-| 写请求 403 `cross-site request blocked` | 请求 `Origin` 不在 `BOXLI_FRONTEND_URL` / `BOXLI_EXTRA_ORIGINS` 白名单 |
-| `/auth/login` 返回 503 | 未配 OAuth 凭证且 `BOXLI_DEV_LOGIN` 未开 → 补凭证或设 `BOXLI_DEV_LOGIN=1` |
+| 写请求 403 `cross-site request blocked` | 请求 `Origin` 不在 `[site] frontend_url` / `extra_origins` 白名单 |
+| `/auth/login` 返回 503 | 未配 OAuth 凭证且 `[dev] enabled` 未开 → 补凭证或临时开启 dev |
 | dev 登录返回 409 | 用户名已被占用（L7 防护）；换一个用户名 |
 | 端口 `EADDRINUSE` | 旧进程未退出。先 `ss -ltnpe` 看**归属**再动手：`uid:`/`cgroup:` 能说明是谁占用（如 `forgejo.service`），`users:(("hub",pid=…))` 则是本项目后端，可用 `pkill -f 'go run ./cmd/hub'` 清理 |
-| 前端起不来 / 打开 `localhost:3000` 不是本站 | **3000 是 Forgejo**，不是 Boxli 前端；换端口（如 `PORT=3011`）并同步 `BOXLI_FRONTEND_URL` |
-| 登录后回跳到 Forgejo 页面 | `BOXLI_FRONTEND_URL` 仍是默认 `http://localhost:3000` → 改为前端实际端口 |
+| 前端起不来 / 打开 `localhost:3000` 不是本站 | **3000 是 Forgejo**，不是 Boxli 前端；换端口（如 `PORT=3011`）并同步 `[site] frontend_url` |
+| 登录后回跳到 Forgejo 页面 | `[site] frontend_url` 仍指向 3000（Forgejo）→ 改为前端实际端口 |
 | `.bin/nuxt` 权限拒绝 | 用 `node node_modules/nuxt/bin/nuxt.mjs` 直接运行 |
 
 ---
@@ -756,7 +758,7 @@ cd backend && go test ./... -count=1 -v
 | OAuth CSRF / 授权码重放 | state 一次性原子消费（`DELETE ... RETURNING`） | `auth/state.go` |
 | 账号接管 | username 冲突返回 409，**不退化查找** | `hub/handlers_auth.go` |
 | 会话伪造 / 盗用 | JWT HS256 签名 + `sessions` 表哈希校验 + 可吊销 | `auth/auth.go` |
-| 本地调试后门流入生产 | `BOXLI_DEV_LOGIN` **默认关闭** | `config/config.go` |
+| 本地调试后门流入生产 | `[dev] enabled` **默认关闭**，且设为 `true` 时程序拒绝启动 | `config/config.go` |
 | Markdown XSS | `markdown-it(html:false)` + DOMPurify 清洗 | `composables/useMarkdown.ts` |
 | 外链劫持 | 自动补 `rel="noopener noreferrer nofollow"` | 同上 |
 | 请求体过大 | `http.MaxBytesReader` 限制 1 MiB | `hub/server.go` |
@@ -768,7 +770,7 @@ cd backend && go test ./... -count=1 -v
 
 - **L6**：无速率限制、无请求 ID 日志
 - **L5 收尾**：生产由 Nginx 同源反代后移除 CORS 头
-- **轮换 `BOXLI_GITHUB_SECRET`**：该 secret 曾以明文外泄，**上线前必须在 GitHub Regenerate**
+- **轮换 `[github] secret`**：该 secret 曾以明文外泄，**上线前必须在 GitHub Regenerate**
 
 ---
 
@@ -815,34 +817,33 @@ pkill -f 'go run ./cmd/hub'      # 5 组重复实例（父 + 子共 10 个进程
 - **PostgreSQL 保留**（`:5432`，项目依赖），数据基线未变：`5 users / 5 repos / 10 tags / 17 sources`
 - **`:3000` 未动** —— 那是 Forgejo 系统服务，**不属于本项目，不得清理**
 
-**⚠️ 由此产生的必须修正项：前端端口与 `BOXLI_FRONTEND_URL`**
+**⚠️ 由此产生的必须修正项：前端端口与 `[site] frontend_url`**
 
 既然 `:3000` 长期被 Forgejo 占用，**Boxli 前端在本机不能使用 3000**。
-而 `BOXLI_FRONTEND_URL` 的代码默认值正是 `http://localhost:3000`
-（[`config/config.go`](backend/internal/config/config.go) 中 `getenv("BOXLI_FRONTEND_URL", "http://localhost:3000")`），
-`backend/.env` 亦未覆盖。这会导致两个真实故障：
+而 `[site] frontend_url` 的默认值曾是 `http://localhost:3000`。这会导致两个真实故障：
 
 | 故障 | 原因 |
 |---|---|
-| OAuth 成功后 **302 落到 Forgejo** 而非本站 | `BOXLI_FRONTEND_URL` 即回跳目标站点 |
-| 真实前端的**写请求被 403 拒绝** | 同一变量也是 `OriginGuard` 的 CSRF 来源白名单，白名单里是 Forgejo 的 origin |
+| OAuth 成功后 **302 落到 Forgejo** 而非本站 | `[site] frontend_url` 即回跳目标站点 |
+| 真实前端的**写请求被 403 拒绝** | 同一字段也是 `OriginGuard` 的 CSRF 来源白名单，白名单里是 Forgejo 的 origin |
 
-**解除方式**（前端换端口，后端指向同一端口）：
+**解除方式**（前端换端口，后端指向同一端口）：`hub.toml` 的默认值现已改为
+`http://localhost:3011`，只需确认与前端实际端口一致：
+
+```toml
+[site]
+frontend_url = "http://localhost:3011"
+```
 
 ```bash
-# 后端：回跳落点 + CSRF 白名单都指向前端实际端口（示例 3011）
-cd backend && set -a && . ./.env && set +a
-export BOXLI_FRONTEND_URL=http://localhost:3011
-go run ./cmd/hub
-
-# 前端：显式指定非 3000 端口
+cd backend && go run ./cmd/hub
 cd frontend && PORT=3011 node .output/server/index.mjs
 ```
 
 随后访问 `http://localhost:3011/login` 完成一次授权，即可补齐端到端验证。
 
 > **GitHub App 登记无需改动**：回调仍是 `http://127.0.0.1:3727/api/v1/auth/callback`（后端承接），
-> 变的只是前端端口与 `BOXLI_FRONTEND_URL`。
+> 变的只是前端端口与 `[site] frontend_url`。
 >
 > 空闲可用端口参考：**3011**、**3077**（`:3000` 属 Forgejo，`:3001` 属 docker-proxy）。
 
@@ -880,9 +881,9 @@ cd frontend && PORT=3011 node .output/server/index.mjs
 - Nginx：前端托管 + `/api/` 反代 + `/docs/`
 - Let's Encrypt HTTPS
 - systemd：`boxli-hub.service` + 前端服务
-- **`BOXLI_COOKIE_SECURE=true`**（生产 HTTPS 必须）
-- `BOXLI_FRONTEND_URL=https://boxli.dev`，并同步更新 GitHub App 登记的 production 回调地址
-- **Regenerate `BOXLI_GITHUB_SECRET`**
+- **`[session] cookie_secure = true`**（生产 HTTPS 必须；配 `http://` 会拒绝启动）
+- **`[site] frontend_url = "https://boxli.dev"`**，并同步更新 GitHub App 登记的 production 回调地址
+- **Regenerate `[github] secret`**
 - ufw 只开 80/443；确认 3727/5432 不可达
 - 每日数据库备份 + 定时任务
 - 移除 CORS 头（同源反代后不再需要）

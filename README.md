@@ -92,7 +92,7 @@ backend/
     ├── auth/         # JWT 签发/校验、sessions 表、GitHub OAuth、state 一次性校验
     │                 #  + cookie.go（httpOnly 会话 Cookie）
     │                 #  + origin.go（CSRF 来源白名单校验）
-    ├── config/       # 环境变量配置
+    ├── config/       # TOML 配置加载与校验（hub.toml）
     ├── db/           # 连接池 + 内嵌 SQL 迁移
     │   └── migrations/
     ├── hub/          # HTTP 路由与处理器（读/写/认证）
@@ -138,7 +138,8 @@ $PGROOT/bin/pg_ctl -D "$PGDATA" stop
 cd backend
 # Go 缓存需落在工作区内（沙箱不允许写 ~/.cache 与 ~/go）
 export GOCACHE=/home/xgp2012/hub/.devtools/gocache GOMODCACHE=/home/xgp2012/hub/.devtools/gomodcache GOPATH=/home/xgp2012/hub/.devtools/gopath
-export BOXLI_DB="postgres://boxli:boxli@127.0.0.1:5432/boxli_hub?sslmode=disable"
+# 首次需从示例生成配置
+cp hub.toml.example hub.toml
 go run ./cmd/seed
 ```
 
@@ -151,11 +152,7 @@ go run ./cmd/seed
 ```bash
 cd backend
 export GOCACHE=/home/xgp2012/hub/.devtools/gocache GOMODCACHE=/home/xgp2012/hub/.devtools/gomodcache GOPATH=/home/xgp2012/hub/.devtools/gopath
-# 设置鉴权密钥（不设则认证接口返回 503，读接口不受影响）
-export BOXLI_JWT_SECRET="dev-secret-change-me"
-export BOXLI_DB="postgres://boxli:boxli@127.0.0.1:5432/boxli_hub?sslmode=disable"
-# ⚠️ 必须与前端实际端口一致（默认值是 3000，而本机 3000 已被 Forgejo 占用）
-export BOXLI_FRONTEND_URL="http://localhost:3011"
+# 配置全部来自 hub.toml（默认读当前目录），可用 --config 指定其他路径
 go run ./cmd/hub
 ```
 
@@ -163,7 +160,7 @@ go run ./cmd/hub
 
 > **⚠️ 本机 3000 端口已被 Forgejo 占用**（`forgejo.service`，uid 115，systemd 开机自启）。
 > 此前文档写的「前端跑在 localhost:3000」在本机**不成立**，必须换一个端口，
-> 并**同步设置后端 `BOXLI_FRONTEND_URL`**（见下）。当前空闲可用端口：**3011**、**3077**。
+> 并**同步修改后端 `hub.toml` 的 `[site] frontend_url`**（见下）。当前空闲可用端口：**3011**、**3077**。
 
 ```bash
 cd frontend
@@ -179,12 +176,13 @@ PORT=3011 npm run dev
 
 前端 dev 通过 `routeRules` 把 `/api/**` 代理到 `http://127.0.0.1:3727`，无需 CORS。
 
-**⚠️ 后端必须知道前端在哪个端口**：`BOXLI_FRONTEND_URL` 既是 OAuth 成功后 302 的落点，
-**也是写接口的 CSRF 来源白名单**。若前端跑 3011 而该变量仍是默认的 `http://localhost:3000`，
-则回跳会落到 Forgejo，且真实前端的写请求会被 403 拒绝。启动后端时须显式指定：
+**⚠️ 后端必须知道前端在哪个端口**：`[site] frontend_url` 既是 OAuth 成功后 302 的落点，
+**也是写接口的 CSRF 来源白名单**。若前端跑 3011 而该值仍是默认的 `http://localhost:3011`
+之外的地址，则回跳会落到错误的站点，且真实前端的写请求会被 403 拒绝。修改 `hub.toml`：
 
-```bash
-export BOXLI_FRONTEND_URL=http://localhost:3011
+```toml
+[site]
+frontend_url = "http://localhost:3011"
 ```
 
 ### 验证
@@ -198,7 +196,7 @@ curl http://localhost:3011/api/v1/health
 
 ### 5. 登录联调（未配 OAuth 时）
 
-未配置 `BOXLI_GITHUB_CLIENT_ID/SECRET` **且**显式开启 `BOXLI_DEV_LOGIN=1` 时，
+未配置 `[github] client_id/secret` **且**显式开启 `[dev] enabled = true` 时，
 `POST /auth/login` 走 **dev 模拟登录**，直接签发会话，便于本地联调：
 
 ```bash
@@ -208,14 +206,15 @@ curl -X POST http://127.0.0.1:3727/api/v1/auth/login \
 # 响应 data.token 即 JWT；同时下发 httpOnly Cookie，后续写接口可直接用 -b cookies.txt
 ```
 
-> **⚠️ dev 模拟登录默认关闭**（`BOXLI_DEV_LOGIN=0`）。开启后任何人传一个 `github_user`
+> **⚠️ dev 模拟登录默认关闭**（`[dev] enabled = false`）。开启后任何人传一个 `github_user`
 > 即可登录为任意账号，**生产环境绝不能开启**。未开启且未配 OAuth 时，`/auth/login` 返回 503。
+> 另外，把 `enabled` 设为 `true` 时**程序会直接拒绝启动**，防止误带入生产。
 >
 > 注意：dev 模拟登录每次生成**随机 `github_id`**，若该 `github_user` 已存在会返回
 > **409**（L7 的账号接管防护），换一个未占用的用户名即可。
 
 配好 OAuth 凭证后，同一接口自动改为返回 `authorize_url`，走真实 GitHub 流程
-（此时 `BOXLI_DEV_LOGIN` 不再生效）。
+（此时 `[dev] enabled` 不再生效）。
 
 
 ### 6. GitHub OAuth 凭据配置（阶段 4）
@@ -223,18 +222,18 @@ curl -X POST http://127.0.0.1:3727/api/v1/auth/login \
 在 GitHub → Settings → Developer settings → **OAuth Apps** 创建应用，需要填：
 
 - **Homepage URL**：本地填前端实际端口（如 `http://localhost:3011`；**本机不要用 3000，已被 Forgejo 占用**），生产填 `https://boxli.dev`
-- **Authorization callback URL**：**必须与 `BOXLI_GITHUB_REDIRECT` 完全一致**，否则 GitHub 拒绝回调
+- **Authorization callback URL**：**必须与 `hub.toml` 里的 `[github] redirect` 完全一致**，否则 GitHub 拒绝回调
 
-本项目已申请的应用凭据（Client ID 为公开信息；**Secret 不写入仓库**）：
+本项目已申请的应用凭据（Client ID 为公开信息；**Secret 不写入仓库**，写在本机被 gitignore 的 `backend/hub.toml` 中）：
 
-| 变量 | 值 | 说明 |
+| hub.toml 字段 | 值 | 说明 |
 |---|---|---|
-| `BOXLI_GITHUB_CLIENT_ID` | `Ov23lidTkmYmm6aJtJKM` | 20 位，`Ov23li` 前缀 = 2023 年后 GitHub Client ID 格式 |
-| `BOXLI_GITHUB_SECRET` | 见密码管理器 / 环境变量 | 40 位十六进制；**不得提交到仓库或写入文档** |
-| `BOXLI_GITHUB_REDIRECT` | 须与 App 登记一致 | 本地建议 `http://127.0.0.1:3727/api/v1/auth/callback` |
+| `[github] client_id` | `Ov23lidTkmYmm6aJtJKM` | 20 位，`Ov23li` 前缀 = 2023 年后 GitHub Client ID 格式 |
+| `[github] secret` | 见密码管理器 | 40 位十六进制；**不得提交到仓库或写入文档** |
+| `[github] redirect` | 须与 App 登记一致 | 本地建议 `http://127.0.0.1:3727/api/v1/auth/callback` |
 
 > **✅ 回调地址已确认可用（2026-10-02 复测）**：App 上登记的 Authorization callback URL 即
-> `http://127.0.0.1:3727/api/v1/auth/callback`，与 `BOXLI_GITHUB_REDIRECT` 一致。
+> `http://127.0.0.1:3727/api/v1/auth/callback`，与 `[github] redirect` 一致。
 >
 > 实测证据：
 > - `access_token` 换 token 请求带该 `redirect_uri` → 返回 `bad_verification_code`
@@ -255,10 +254,13 @@ curl -X POST http://127.0.0.1:3727/api/v1/auth/login \
 验证配对是否正确（用假 code 试探，不会拿到任何真实 token）：
 
 ```bash
+# 用 shell 变量代入（值取自 backend/hub.toml）
+CID=$(grep -oP '(?<=^client_id = ").*(?=")' backend/hub.toml)
+CSEC=$(grep -oP '(?<=^secret = ").*(?=")' backend/hub.toml)
 curl -s -X POST https://github.com/login/oauth/access_token \
   -H 'Accept: application/json' \
-  -d "client_id=$BOXLI_GITHUB_CLIENT_ID" \
-  -d "client_secret=$BOXLI_GITHUB_SECRET" \
+  -d "client_id=$CID" \
+  -d "client_secret=$CSEC" \
   -d "code=invalid_test_code"
 # 配对正确 → {"error":"bad_verification_code", ...}   （凭据有效，仅 code 无效）
 # 配反对调 → {"error":"Not Found"}                      （GitHub 不认识该 App）
@@ -267,9 +269,9 @@ curl -s -X POST https://github.com/login/oauth/access_token \
 > **注意**：若要同时验证 `redirect_uri`，加上 `-d "redirect_uri=..."`；若返回
 > `redirect_uri_mismatch` 则说明该地址未在 App 上登记（见上方说明）。
 
-> **⚠️ 安全要求**：`BOXLI_GITHUB_SECRET` 只应通过环境变量注入，`.env` 文件需加入
-> `.gitignore`（已配置）；若曾以任何形式外泄（聊天、日志、截图），**必须立即在 GitHub 上
-> Regenerate client secret** 并更新部署环境。
+> **⚠️ 安全要求**：`[github] secret` 写在 `backend/hub.toml` 中，该文件已加入
+> `.gitignore`（已配置），**禁止提交**；若曾以任何形式外泄（聊天、日志、截图），
+> **必须立即在 GitHub 上 Regenerate client secret** 并更新部署配置。
 
 ## 开发环境遗留项（⚠️ 上线前需还原）
 
@@ -281,44 +283,76 @@ curl -s -X POST https://github.com/login/oauth/access_token \
 
 | # | 改动 | 处理时机 |
 |---|---|---|
-| ~~L3~~ | ~~认证仅有 dev 模拟登录~~ → **已接入真实 GitHub OAuth**（配好凭证即自动切换；dev 模拟登录改为需显式 `BOXLI_DEV_LOGIN=1` 才启用的调试开关） | ✅ 阶段 4 已解决 |
+| ~~L3~~ | ~~认证仅有 dev 模拟登录~~ → **已接入真实 GitHub OAuth**（配好凭证即自动切换；dev 模拟登录改为需显式 `[dev] enabled = true` 才启用的调试开关） | ✅ 阶段 4 已解决 |
 | ~~L4~~ | ~~OAuth `state` 未做服务端校验~~ → **已实现一次性 state 校验**（`oauth_states` 表，10 分钟 TTL + 单次消费，防 CSRF/重放） | ✅ 阶段 4 已解决 |
 | ~~L7~~ | ~~`upsertUser` 的 username 冲突回退逻辑~~ → **已移除危险的「按 username 退化查找」**（原逻辑会把新 GitHub 账号登录成同名老用户，属账号接管）；现返回 409 | ✅ 阶段 4 已解决 |
 | L5 | 后端 CORS 曾为 `Access-Control-Allow-Origin: *` | 🔄 **阶段 4 已部分推进**：`*` 与 Cookie 凭证请求不兼容，已改为白名单回显 Origin + `Allow-Credentials` + `Vary: Origin`；生产由 Nginx 同源反代后可彻底移除 |
 | L6 | 后端无速率限制 / 无请求 ID 日志 | 阶段 6/7 视需要 |
 
-## 环境变量
+## 配置文件（TOML）
 
-后端从环境变量读取，均带默认值（见 `backend/.env.example`）：
+后端**不使用任何环境变量**，全部配置来自 TOML 文件。默认读取当前目录的 `hub.toml`，
+可用 `--config` 指定其他路径：
 
-| 变量 | 默认 | 说明 |
+```bash
+cp backend/hub.toml.example backend/hub.toml   # 首次
+./boxli-hub                                     # 读 ./hub.toml
+./boxli-hub --config /etc/boxli-hub/hub.toml    # 读指定文件
+```
+
+这是二进制**唯一**解析的命令行参数。
+
+### 字段一览
+
+| TOML 字段 | 默认 | 说明 |
 |---|---|---|
-| `BOXLI_ADDR` | `127.0.0.1:3727` | 后端监听地址 |
-| `BOXLI_DB` | 上表连接串 | PostgreSQL 连接串 |
-| `BOXLI_DATA_DIR` | `./data` | 数据目录 |
-| `BOXLI_JWT_SECRET` | 空 | JWT 签名密钥（**必填**才能登录，未设则认证接口返回 503）|
-| `BOXLI_GITHUB_CLIENT_ID` | 空 | GitHub OAuth Client ID（未设则启用 dev 模拟登录）|
-| `BOXLI_GITHUB_SECRET` | 空 | GitHub OAuth Client Secret（40 位 hex，**禁止提交/外泄**）|
-| `BOXLI_GITHUB_REDIRECT` | 空 | GitHub OAuth 回调地址（须与 App 登记一致）|
-| `BOXLI_SESSION_TTL_HOURS` | `720` | 会话有效期（小时）|
-| `BOXLI_FRONTEND_URL` | `http://localhost:3000` | OAuth 成功后 302 回跳的前端站点；**同时是写接口的 CSRF 来源白名单**。⚠️ **本机必须显式覆盖**：3000 已被 Forgejo 占用，前端须换端口（如 3011），此变量需同步改，否则回跳落错站点且写请求被 403 |
-| `BOXLI_COOKIE_SECURE` | `false` | 会话 Cookie 是否带 `Secure`。生产 HTTPS 必须 `true`；本地 `http://localhost` 必须 `false`，否则浏览器丢弃 Cookie |
-| `BOXLI_EXTRA_ORIGINS` | 空 | 额外允许的跨站来源（逗号分隔），仅多域名/CI 场景 |
-| `BOXLI_DEV_LOGIN` | `false` | **⚠️ 模拟登录后门**，仅本地调试；生产必须保持关闭 |
+| `[server] addr` | `127.0.0.1:3727` | 监听地址。**只允许回环地址**（填 `0.0.0.0` 会拒绝启动），对外由 Nginx 反代 |
+| `[db] url` | 本地连接串 | PostgreSQL 连接串 |
+| `[session] jwt_secret` | 空 | JWT 签名密钥（**必填**才能登录，未设则认证接口返回 503；≥16 字符）|
+| `[session] ttl_hours` | `720` | 会话有效期（小时）|
+| `[session] cookie_secure` | `false` | 会话 Cookie 是否带 `Secure`。生产 HTTPS 必须 `true`；本地 `http://` 必须 `false`，否则浏览器丢弃 Cookie |
+| `[github] client_id` | 空 | GitHub OAuth Client ID |
+| `[github] secret` | 空 | GitHub OAuth Client Secret（40 位 hex，**禁止提交/外泄**）|
+| `[github] redirect` | 空 | GitHub OAuth 回调地址（须与 App 登记一致；配了凭据则必填）|
+| `[site] frontend_url` | `http://localhost:3011` | OAuth 成功后 302 回跳的前端站点；**同时是写接口的 CSRF 来源白名单**。⚠️ **本机必须与实际端口一致**：3000 已被 Forgejo 占用，前端须换端口（如 3011），否则回跳落错站点且写请求被 403 |
+| `[site] extra_origins` | `[]` | 额外允许的跨站来源（数组），仅多域名/CI 场景 |
+| `[dev] enabled` | `false` | **⚠️ 模拟登录后门**，仅本地调试；设为 `true` 时**程序拒绝启动** |
+
+> 旧的 `BOXLI_DATA_DIR` 未迁移：该字段在代码中从未被读取（死配置）。
+
+### 启动期校验
+
+配置写错会在启动时报错退出，而不是带着坏配置跑起来。已覆盖：
+
+| 检查 | 拒绝原因 |
+|---|---|
+| 无法识别的配置项 | 防止键名拼错后静默不生效 |
+| `addr` 非回环 / 缺少端口 | 避免绕开 Nginx 的 HTTPS 与 CSRF 保护 |
+| `jwt_secret` 短于 16 字符 | 弱密钥 |
+| 只配 `client_id` 或只配 `secret` | 会静默降级为未配置 |
+| 配了凭据却没有 `redirect` | 回调必然失败 |
+| `frontend_url` 带路径 / 协议非法 | OriginGuard 按 `scheme://host:port` 精确比对，带路径永远匹配不上 |
+| `cookie_secure=true` 却配 `http://` | 浏览器丢弃 Cookie，表现为「登录后仍显示未登录」 |
+| 公网 `https://` 却未开 `cookie_secure` | Cookie 会在明文信道传输 |
+| `[dev] enabled = true` | 模拟登录后门 |
+
+> 启动日志会打印一行配置摘要（如 `config{path=... addr=... db=postgres://boxli:***@...}`），
+> **数据库密码与全部密钥均已脱敏**。
 
 **认证模式切换规则**（见 `backend/internal/hub/handlers_auth.go`）：
 
-| `CLIENT_ID` | `SECRET` | `BOXLI_DEV_LOGIN` | `POST /auth/login` 行为 |
+| `client_id` | `secret` | `[dev] enabled` | `POST /auth/login` 行为 |
 |---|---|---|---|
 | 已设 | 已设 | 任意 | 返回 `authorize_url`，走真实 GitHub OAuth（阶段 4 目标状态）|
-| 任一为空 | 任一为空 | `1`/`true` | **dev 模拟登录**，按 `{github_user}` 下发会话 |
-| 任一为空 | 任一为空 | 未设/`0` | **503**，明确拒绝（默认行为）|
+| 留空 | 留空 | `true` | **dev 模拟登录**，按 `{github_user}` 下发会话 |
+| 留空 | 留空 | `false` | **503**，明确拒绝（默认行为）|
 
-> 即：只设 Client ID 而不设 Secret 且未开启 dev 登录时会返回 503，不会静默降级为模拟登录。
+> 即：只设 Client ID 而不设 Secret 时，配置加载阶段就会**直接报错退出**，
+> 不会静默降级为模拟登录或 503。
 
-> **⚠️ `BOXLI_COOKIE_SECURE` 与访问协议必须匹配**：本地 `http://localhost` 下若设为 `true`，
+> **⚠️ `cookie_secure` 与访问协议必须匹配**：本地 `http://localhost` 下若设为 `true`，
 > 浏览器会丢弃 Cookie，症状是「登录看似成功但始终显示未登录」。生产 HTTPS 下若设为 `false`，
-> Cookie 会在明文信道上传输。
+> Cookie 会在明文信道上传输。两者不匹配时**启动即报错**。
 
 
 ## 数据模型
@@ -542,7 +576,7 @@ Lighthouse Mobile ≥ 90、真实触摸/滚动惯性、iOS 地址栏 `100dvh` �
 - ✅ **CSRF 双层防护**：`SameSite=Lax` + `OriginGuard` 精确同源校验
 - ✅ **开放重定向防护**：`safeRedirectPath` 仅放行站内相对路径
 - ✅ **CORS 修正**：`Allow-Origin: *` 与 Cookie 凭证不兼容，改为白名单回显 + `Allow-Credentials`
-- ✅ **dev 模拟登录改为显式开关**（`BOXLI_DEV_LOGIN`，默认关闭）
+- ✅ **dev 模拟登录改为显式开关**（`[dev] enabled`，默认关闭）
 - ✅ 授权页实测可达，显示 App 名 **boxli**（Client ID 有效）
 - ✅ 单元测试 **8 个用例组（另 13 个子例）** 全通过（`go test ./...`）
 
@@ -560,8 +594,8 @@ Lighthouse Mobile ≥ 90、真实触摸/滚动惯性、iOS 地址栏 `100dvh` �
 
 **尚需处理：**
 
-1. ✅ `BOXLI_GITHUB_REDIRECT` 已与 App 登记值一致（复测通过）
-2. ⚠️ `BOXLI_GITHUB_SECRET` **曾明文外泄，上线前必须 Regenerate**（阶段 7）
+1. ✅ `[github] redirect` 已与 App 登记值一致（复测通过）
+2. ⚠️ `[github] secret` **曾明文外泄，上线前必须 Regenerate**（阶段 7）
 3. ✅ **陈旧进程已清理（2026-10-03）** —— 原先记录的「`127.0.0.1:3727` 与 `localhost:3000`
    被**孤儿进程**占用且跑陈旧构建」**诊断有误，已更正**：
 
@@ -573,13 +607,13 @@ Lighthouse Mobile ≥ 90、真实触摸/滚动惯性、iOS 地址栏 `100dvh` �
      **全部是 Forgejo 的响应**，并非「陈旧的前端构建」。
 
    ⚠️ **由此得出一个必须遵守的约束**：本机**前端不能再用 3000**（与 Forgejo 冲突），
-   须改用其他端口（如 **3011**），并**同步设置 `BOXLI_FRONTEND_URL`** 指向该端口。
-   否则该变量会落到默认值 `http://localhost:3000`（即 Forgejo），导致
+   须改用其他端口（如 **3011**），并**同步修改 `hub.toml` 的 `[site] frontend_url`** 指向该端口。
+   否则该值仍是 `http://localhost:3000`（即 Forgejo），导致
    **OAuth 回跳落错站点**、且**写接口 CSRF 白名单拒绝真实前端（403）**。
    详见 `plants.md` 阶段 4「阻塞项」一节。
 
 4. ⚠️ **真实授权联调仍未完成** —— 但**已不再被端口占用阻塞**（进程已清理）。
-   现只需：设定 `BOXLI_FRONTEND_URL` → 启动后端 :3727 → 启动前端（非 3000 端口）
+   现只需：改好 `hub.toml` → 启动后端 :3727 → 启动前端（非 3000 端口）
    → 人工点一次授权。
 5. ⚠️ 阶段 4 新增页面与阶段 3 一样**只有静态断言**，真实浏览器验收属**阶段 6**
 

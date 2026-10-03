@@ -1,0 +1,71 @@
+# ============================================================================
+# Boxli Hub 后端配置示例
+#
+# 用法：复制本文件为 hub.toml 后按需修改
+#   cp hub.toml.example hub.toml
+#
+# 启动：
+#   ./boxli-hub                      # 读取当前目录的 hub.toml
+#   ./boxli-hub --config /etc/boxli-hub/hub.toml
+#
+# 说明：
+#   - 配置文件是唯一的配置来源，程序不读取任何环境变量。
+#   - 所有字段都有默认值，未写的字段取默认值。
+#   - 写了无法识别的字段会直接启动失败（防止拼错后静默不生效）。
+# ============================================================================
+
+[server]
+# 监听地址。**只允许回环地址**（127.0.0.1 / localhost / ::1），
+# 对外访问一律由 Nginx 反向代理，否则会绕开 HTTPS 与 CSRF 来源校验。
+addr = "127.0.0.1:3727"
+
+[db]
+# PostgreSQL 连接串。密码含特殊字符时需做 URL 编码。
+url = "postgres://boxli:boxli@127.0.0.1:5432/boxli_hub?sslmode=disable"
+
+[session]
+# 会话签名密钥（JWT HS256）。**留空则无法登录**（认证接口返回 503）。
+# 生成：openssl rand -hex 32
+jwt_secret = ""
+
+# 会话有效期（小时）。默认 720 = 30 天。
+ttl_hours = 720
+
+# 会话 Cookie 是否带 Secure 属性。
+#   - 本地 http:// 必须 false：否则浏览器直接丢弃 Cookie，表现为「登录后仍显示未登录」
+#   - 生产 HTTPS 必须 true：否则 Cookie 会在明文信道传输
+# 与 [site].frontend_url 的协议不匹配时启动即报错。
+cookie_secure = false
+
+[github]
+# GitHub OAuth App 凭据。
+# client_id 与 secret 必须同时配置或同时留空：只配其一会导致登录静默失败。
+# 两者都配置后自动启用真实 OAuth；都留空时：
+#   - [dev].enabled = true  → 降级为模拟登录（仅限本地调试）
+#   - [dev].enabled = false → 认证接口返回 503（默认，明确拒绝）
+client_id = ""
+# ⚠️ 禁止提交到仓库、禁止出现在聊天/日志/截图中。若曾外泄请立即在 GitHub 上 Regenerate。
+secret = ""
+# 必须与 GitHub 上登记的 Authorization callback URL **完全一致**，
+# 否则换 token 时返回 redirect_uri_mismatch。
+#   本地：http://127.0.0.1:3727/api/v1/auth/callback
+#   生产：https://boxli.dev/api/v1/auth/callback
+# 配了 client_id/secret 后本项必填。
+redirect = ""
+
+[site]
+# 前端站点地址，身兼两职：
+#   1. OAuth 成功后 302 的回跳落点
+#   2. 写接口 CSRF 校验的来源白名单（按 scheme://host:port 精确比对）
+# ⚠️ 必须是前端**实际访问**的地址。本机 :3000 已被 Forgejo 占用，
+#    前端请改用 3011 等空闲端口，并与此处保持一致。
+# 只能填 scheme://host[:port]，不能带路径。
+frontend_url = "http://localhost:3011"
+
+# 额外允许的跨站来源，仅多域名 / CI 场景需要，默认只信任 frontend_url。
+# extra_origins = ["http://127.0.0.1:3011"]
+
+[dev]
+# ⚠️ 模拟登录后门：开启后 POST /auth/login 传 {"github_user":"x"} 即可登录为任意账号。
+# 仅限本地调试。**置为 true 时程序会直接拒绝启动**，避免误带入生产。
+enabled = false
