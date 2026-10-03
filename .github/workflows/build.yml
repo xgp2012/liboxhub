@@ -132,14 +132,23 @@ jobs:
           set -euo pipefail
           file dist/boxli-hub
           ls -lh dist/boxli-hub
-          # 确认是静态链接的可执行文件
-          if ldd dist/boxli-hub 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+
+          # 确认是静态链接的可执行文件。
+          #
+          # 注意：对静态二进制，ldd 会把 "not a dynamic executable" 写到 **stderr**
+          # 并以 **退出码 1** 结束。因此不能写成 `ldd ... | grep -q ...`：
+          # 在 `set -o pipefail` 下管道会因 ldd 的非零退出码而失败，
+          # 即使 grep 已经匹配成功（CI 上确实踩到了这个坑）。
+          # 正确做法是先捕获输出、吞掉 ldd 的退出码，再判断内容。
+          LDD_OUT=$(ldd dist/boxli-hub 2>&1 || true)
+          if echo "$LDD_OUT" | grep -q 'not a dynamic executable\|statically linked'; then
             echo "✓ 静态链接"
           else
             echo "::error::二进制不是静态链接"
-            ldd dist/boxli-hub || true
+            echo "$LDD_OUT"
             exit 1
           fi
+
           # 确认前端产物确实被嵌入了（体积应显著大于纯后端）
           SIZE=$(stat -c%s dist/boxli-hub)
           if [ "$SIZE" -lt 20000000 ]; then
@@ -147,6 +156,15 @@ jobs:
             exit 1
           fi
           echo "✓ 体积 $SIZE 字节，前端产物已嵌入"
+
+          # 确认版本信息注入生效
+          chmod +x dist/boxli-hub
+          ./dist/boxli-hub --version | tee /tmp/ver.txt
+          grep -q "${GITHUB_SHA::8}" /tmp/ver.txt || {
+            echo "::error::--version 未包含 commit 信息"
+            exit 1
+          }
+          echo "✓ 版本信息正确"
 
       # 附带一份配置示例，方便直接部署
       - name: Prepare release bundle
